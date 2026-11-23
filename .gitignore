@@ -1,0 +1,54 @@
+/target/
+/runtime/
+*.log
+*.tmp
+/sync-server/data/
+__pycache__/
+*.sjsync
+
+# Local executables, models and build outputs
+*.exe
+*.dll
+*.pdb
+*.bin
+*.part
+
+# Vaults, credentials and portable backups stay on the device
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.dpapi
+*.enc
+*.sjn
+.env
+deploy/.casdoor/
+/sync-server/.casdoor/
+.env.*
+!.env.example
+vault-key*
+device-id
+store.lock
+sync-config*
+sync-assets/
+scratch/
+migration-backups/
+
+# Local editor and OS files
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Android local SDK, native output and Gradle caches
+/apps/android/.gradle/
+/apps/android/.kotlin/
+/apps/android/local.properties
+/apps/android/**/build/
+/apps/android/app/src/main/jniLibs/
+*.apk
+*.aab
+*.keystore
+*.p12

@@ -1,0 +1,78 @@
+name: suojian
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+services:
+  init:
+    image: python:3.11-slim
+    logging: *logging
+    command: [python, /setup/bootstrap.py]
+    environment:
+      SUOJIAN_ORIGIN: ${SUOJIAN_ORIGIN:?Set SUOJIAN_ORIGIN in sync-server/.env}
+      CASDOOR_CLIENT_SECRET: ${CASDOOR_CLIENT_SECRET:-}
+      CASDOOR_ADMIN_PASSWORD: ${CASDOOR_ADMIN_PASSWORD:-}
+    volumes:
+      - ./bootstrap.py:/setup/bootstrap.py:ro
+      - ./Caddyfile.fragment:/setup/Caddyfile.fragment:ro
+      - ./.casdoor:/state
+  casdoor:
+    image: casbin/casdoor:v4.29.0@sha256:d8fd4f387026e1ffdf887b924c1c74ad5c15e8d3be54fb739b57b2037073a51f
+    logging: *logging
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        initAdminPassword="$$(cat /conf/admin-password)"
+        export initAdminPassword
+        exec /server
+    ports:
+      - 127.0.0.1:19000:8000
+    volumes:
+      - ./.casdoor/casdoor-runtime:/conf:ro
+      - ./.casdoor/data:/data
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  sync:
+    build: .
+    logging: *logging
+    environment:
+      CASDOOR_ENDPOINT: ${SUOJIAN_ORIGIN}
+      CASDOOR_ISSUER: ${SUOJIAN_ORIGIN}
+      CASDOOR_CLIENT_ID: suojian
+      CASDOOR_CLIENT_SECRET_FILE: /run/suojian/client-secret
+    ports:
+      - 127.0.0.1:47831:47831
+    volumes:
+      - casdoor-sync-data:/data
+      - ./.casdoor/sync-runtime:/run/suojian:ro
+    depends_on:
+      casdoor:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:47831/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  caddy:
+    image: caddy:2.10.2
+    logging: *logging
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./.casdoor/caddy-runtime:/etc/caddy:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+volumes:
+  casdoor-sync-data:
+  caddy-data:
+  caddy-config:

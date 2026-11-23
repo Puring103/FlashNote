@@ -1,0 +1,10 @@
+SYNC_ORIGIN {
+    SYNC_TLS
+    @sync path /v1/* /auth/config /auth/login /auth/refresh /auth/logout /health
+    handle @sync {
+        reverse_proxy SYNC_UPSTREAM
+    }
+    handle {
+        reverse_proxy CASDOOR_UPSTREAM
+    }
+}

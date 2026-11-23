@@ -1,0 +1,208 @@
+name: Release FlashNote
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flashnote-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      value: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - id: check
+        name: Check the tag and app versions
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, tomllib
+
+          tag = os.environ['GITHUB_REF_NAME']
+          if os.environ['GITHUB_REF_TYPE'] != 'tag' or not re.fullmatch(r'v\d+\.\d+\.\d+', tag):
+              raise SystemExit('Select an existing version tag such as v0.9.0.')
+          version = tag[1:]
+          with open('Cargo.toml', 'rb') as manifest:
+              desktop = tomllib.load(manifest)['package']['version']
+          gradle = pathlib.Path('apps/android/app/build.gradle.kts').read_text(encoding='utf-8')
+          android = re.search(r'^\s*versionName\s*=\s*"([^"]+)"', gradle, re.M)
+          code = re.search(r'^\s*versionCode\s*=\s*(\d+)', gradle, re.M)
+          if desktop != version or not android or android[1] != version or not code or int(code[1]) <= 0:
+              raise SystemExit('Desktop and Android versions must match the release tag.')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              print(f'version={version}', file=output)
+          PY
+
+  checks:
+    needs: version
+    uses: ./.github/workflows/checks.yml
+
+  windows:
+    needs: version
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Fetch the bundled speech engine
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'whisper-bin-x64.zip'
+          $url = 'https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-bin-x64.zip'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $sha256 = '0D2ECA299C248F965BD0341BCB219DB4B433C7F0C0CE2200D4DF85765E8156A9'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $sha256) {
+            throw 'Speech engine checksum mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath runtime/whisper
+          if (!(Test-Path runtime/whisper/Release/whisper-cli.exe -PathType Leaf)) {
+            throw 'Speech engine bundle incomplete'
+          }
+      - name: Package Windows x64
+        run: |
+          $archive = .\scripts\package.ps1 | Select-Object -Last 1
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item -LiteralPath $archive -Destination "dist/FlashNote-$env:VERSION-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  linux:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config libasound2-dev libwayland-dev libx11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Package Linux x86_64
+        run: |
+          bash scripts/package-linux.sh
+          mkdir dist
+          cp "runtime/packages/FlashNote-${VERSION}-linux-x86_64.tar.gz" dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  android:
+    needs: version
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: apps/android/**/*.gradle.kts
+      - name: Build release APK for ARM64 and x86_64
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $sdkmanager = Join-Path $env:ANDROID_HOME 'cmdline-tools/latest/bin/sdkmanager.bat'
+          & $sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.0.13004108'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\scripts\build-android.ps1 -Abi all -Release
+      - name: Sign and verify the APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if (!$env:ANDROID_KEYSTORE_BASE64 -or !$env:ANDROID_KEYSTORE_PASSWORD) { throw 'Android release signing secrets are missing' }
+          $keyStore = Join-Path $env:RUNNER_TEMP 'flashnote-release.p12'
+          try {
+            [IO.File]::WriteAllBytes($keyStore, [Convert]::FromBase64String($env:ANDROID_KEYSTORE_BASE64))
+            New-Item -ItemType Directory -Path dist | Out-Null
+            $apk = "dist/FlashNote-$env:VERSION-android.apk"
+            .\scripts\sign-android.ps1 -InputApk apps/android/app/build/outputs/apk/release/app-release-unsigned.apk -OutputApk $apk -KeyStore $keyStore
+            $aapt = Join-Path $env:ANDROID_HOME 'build-tools/35.0.0/aapt.exe'
+            $metadata = & $aapt dump badging $apk
+            if ($LASTEXITCODE -ne 0 -or !(($metadata -join "`n").Contains("versionName='$env:VERSION'"))) { throw 'APK version does not match tag' }
+          } finally {
+            if (Test-Path -LiteralPath $keyStore) { Remove-Item -LiteralPath $keyStore -Force }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: dist/*.apk
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [version, checks, windows, linux, android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.value }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Publish all platforms to GitHub Releases
+        shell: bash
+        run: |
+          cd dist
+          files=("FlashNote-${VERSION}-windows-x64.zip" "FlashNote-${VERSION}-linux-x86_64.tar.gz" "FlashNote-${VERSION}-android.apk")
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          tag="$GITHUB_REF_NAME"
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft); then
+            if [[ "$draft" == false ]]; then
+              echo "Release $tag is already published."
+              exit 0
+            fi
+          else
+            notes="../docs/releases/$tag.md"
+            if [[ -f "$notes" ]]; then
+              gh release create "$tag" --verify-tag --draft --title "FlashNote $VERSION" --notes-file "$notes"
+            else
+              gh release create "$tag" --verify-tag --draft --title "FlashNote $VERSION" --generate-notes
+            fi
+          fi
+          gh release upload "$tag" "${files[@]}" SHA256SUMS.txt --clobber
+          gh release edit "$tag" --draft=false

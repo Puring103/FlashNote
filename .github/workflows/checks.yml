@@ -1,0 +1,58 @@
+name: Checks
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop-and-sync:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          python -m pip install -r sync-server/requirements.txt
+      - name: Check Rust formatting and run workspace tests
+        run: |
+          cargo +stable fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +stable test --workspace --all-targets --locked
+      - name: Run sync server tests
+        run: python -m unittest discover -s sync-server -v
+
+  android:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - name: Install Rust and Android SDK components
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $sdkmanager = Join-Path $env:ANDROID_HOME 'cmdline-tools/latest/bin/sdkmanager.bat'
+          & $sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.0.13004108'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build ARM64 APK and run Android checks
+        run: |
+          .\scripts\build-android.ps1 -DebugRust
+          .\apps\android\gradlew.bat -p apps/android testDebugUnitTest lintDebug --console plain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

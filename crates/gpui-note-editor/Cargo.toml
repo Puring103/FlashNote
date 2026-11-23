@@ -1,0 +1,22 @@
+[package]
+name = "gpui-note-editor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Structured note document and native GPUI rich text editor"
+
+[features]
+default = ["gpui-view"]
+gpui-view = ["dep:gpui"]
+
+[dependencies]
+gpui = { version = "=0.2.2", optional = true }
+pulldown-cmark = "0.13"
+unicode-segmentation = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+[[example]]
+name = "editor"
+required-features = ["gpui-view"]
