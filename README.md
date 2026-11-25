@@ -1,6 +1,7 @@
 # 闪记 FlashNote
 
 这个时代，你的灵感很重要!
+
 基于 Rust GPU 的便签软件，极速，轻量，可自部署同步服务
 
 **[下载闪记（Windows、Linux、Android）](https://github.com/Puring103/FlashNote/releases/latest)**
