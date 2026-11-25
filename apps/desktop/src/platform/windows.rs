@@ -585,7 +585,7 @@ pub fn clipboard_bitmap() -> Option<Vec<u8>> {
             let handle = GetClipboardData(17).or_else(|_| GetClipboardData(8)).ok()?;
             let handle = HGLOBAL(handle.0);
             let length = GlobalSize(handle);
-            if !(40..=32 * 1024 * 1024).contains(&length) {
+            if !(40..=suojian_core::media::MAX_FILE as usize - 14).contains(&length) {
                 return None;
             }
             let ptr = GlobalLock(handle);

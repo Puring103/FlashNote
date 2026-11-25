@@ -19,8 +19,8 @@ android {
   applicationId = "com.noteharbor.suojian"
   minSdk = 26
   targetSdk = 35
-  versionCode = 1100
-  versionName = "0.11.0"
+  versionCode = 1200
+  versionName = "0.12.0"
   ndk {
    abiFilters += selectedAbis
   }

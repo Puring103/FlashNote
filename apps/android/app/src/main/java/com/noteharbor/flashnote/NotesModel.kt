@@ -243,7 +243,7 @@ class NotesModel(app: Application, preview: Boolean=false) : AndroidViewModel(ap
    try {
     app.contentResolver.openInputStream(uri)!!.use { input -> file.outputStream().use { output ->
      val buffer=ByteArray(8192); var total=0L
-     while(true) {val count=input.read(buffer);if(count<0) break;total+=count;check(total<=32L*1024*1024) {"附件超过 32MB"};output.write(buffer,0,count)}
+     while(true) {val count=input.read(buffer);if(count<0) break;total+=count;check(total<=128L*1024*1024) {"附件超过 128 MiB"};output.write(buffer,0,count)}
     } }
    } catch(e: Exception) {file.delete();throw e}
   })

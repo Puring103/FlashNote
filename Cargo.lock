@@ -6855,7 +6855,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "suojian"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6909,6 +6909,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "diffy",
+ "flate2",
  "fs2",
  "gpui-note-editor",
  "hkdf",
@@ -6922,6 +6923,7 @@ dependencies = [
  "sha2 0.10.9",
  "strsim",
  "tempfile",
+ "tiff",
  "uuid",
  "windows 0.61.3",
  "zeroize",

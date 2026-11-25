@@ -142,9 +142,13 @@ pub fn read(path: &Path) -> Result<Import> {
         uuid::Uuid::parse_str(&asset)?;
         let mut bytes = Vec::new();
         zip.by_name(&format!("assets/{asset}"))?
-            .take(remaining + 1)
+            .take(remaining.min(crate::media::MAX_FILE) + 1)
             .read_to_end(&mut bytes)?;
         ensure!(bytes.len() as u64 <= remaining, "附件总大小过大");
+        ensure!(
+            bytes.len() as u64 <= crate::media::MAX_FILE,
+            "附件超过 128 MiB"
+        );
         remaining -= bytes.len() as u64;
         assets.insert(asset, bytes);
     }
@@ -330,7 +334,7 @@ impl Store {
             keep.extend(assets(&[note]));
         }
         let mut reclaimed = 0;
-        for directory in ["assets", "sync-assets"] {
+        for directory in ["assets", "sync-assets", "sync-image-receipts"] {
             for entry in std::fs::read_dir(self.root.join(directory))? {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();

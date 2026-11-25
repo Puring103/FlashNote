@@ -25,7 +25,7 @@ use std::{
 
 static SESSION_LOCK: Mutex<()> = Mutex::new(());
 const MAX_RESPONSE: u64 = 256 * 1024 * 1024;
-const MAX_ASSET: u64 = 64 * 1024 * 1024;
+const MAX_ASSET: u64 = crate::media::MAX_FILE + 41; // encryption header, nonce and tag
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -780,29 +780,29 @@ fn prepare_cycle(store: &mut Store, upload: bool) -> Result<Option<Plan>> {
     }))
 }
 
-fn download_assets(c: &Client, plan: &Plan, packet: &Envelope) -> Result<()> {
-    for aid in &packet.header.assets {
-        let path = plan.root.join("assets").join(aid);
-        let cache = plan.root.join("sync-assets").join(aid);
-        let bytes = if cache.exists() {
-            std::fs::read(&cache)?
-        } else {
-            read_response(
-                c.get(endpoint(&plan.config, &format!("assets/{aid}")))
-                    .bearer_auth(&plan.config.session.token)
-                    .send()?,
-                MAX_ASSET,
-            )?
-        };
-        let plain = plan.key.open(&bytes, &format!("suojian/asset/v1/{aid}"))?;
-        if path.exists() {
-            ensure!(std::fs::read(&path)? == plain, "同一附件 ID 的内容不一致");
-        } else {
-            crate::local::atomic_write(&path, &plain)?;
-        }
-        if !cache.exists() {
-            crate::local::atomic_write(&cache, &bytes)?;
-        }
+fn download_asset(c: &Client, plan: &Plan, aid: &str) -> Result<()> {
+    let path = plan.root.join("assets").join(aid);
+    let cache = plan.root.join("sync-assets").join(aid);
+    let bytes = if cache.exists() {
+        std::fs::read(&cache)?
+    } else {
+        read_response(
+            c.get(endpoint(&plan.config, &format!("assets/{aid}")))
+                .timeout(Duration::from_secs(600))
+                .bearer_auth(&plan.config.session.token)
+                .send()?,
+            MAX_ASSET,
+        )?
+    };
+    let plain = crate::local::open_asset(&plan.key, aid, &bytes)?;
+    if path.exists() {
+        crate::local::verify_asset(&plan.root, aid, &std::fs::read(&path)?, &plain)?;
+    }
+    if !cache.exists() {
+        crate::local::atomic_write(&cache, &bytes)?;
+    }
+    if !path.exists() {
+        crate::local::atomic_write(&path, &plain)?;
     }
     Ok(())
 }
@@ -835,9 +835,20 @@ pub fn transfer(mut plan: Plan) -> Result<Cycle> {
     let mut upload_error = None;
     for upload in plan.uploads.iter().filter(|_| !reset) {
         let attempt = (|| -> Result<bool> {
+            let image_assets: BTreeSet<String> = if upload.envelope.header.assets.is_empty() {
+                BTreeSet::new()
+            } else {
+                let note: Note = serde_json::from_slice(&upload.local.payload)?;
+                note.blocks
+                    .into_iter()
+                    .chain(note.media_archive)
+                    .filter_map(|block| match block {
+                        Block::Image { asset, .. } => Some(asset),
+                        _ => None,
+                    })
+                    .collect()
+            };
             for aid in &upload.envelope.header.assets {
-                let bytes = crate::local::wire_asset(&plan.root, &plan.key, aid)?;
-                ensure!(bytes.len() as u64 <= MAX_ASSET, "附件超过同步限制 64MiB");
                 let url = endpoint(&plan.config, &format!("assets/{aid}"));
                 let status = c
                     .head(&url)
@@ -845,8 +856,16 @@ pub fn transfer(mut plan: Plan) -> Result<Cycle> {
                     .send()?
                     .status();
                 if status == StatusCode::NOT_FOUND {
+                    let bytes = crate::local::wire_asset(
+                        &plan.root,
+                        &plan.key,
+                        aid,
+                        image_assets.contains(aid),
+                    )?;
+                    ensure!(bytes.len() as u64 <= MAX_ASSET, "附件超过同步限制 128 MiB");
                     read_response(
                         c.put(url)
+                            .timeout(Duration::from_secs(600))
                             .bearer_auth(&plan.config.session.token)
                             .body(bytes)
                             .send()?,
@@ -854,6 +873,7 @@ pub fn transfer(mut plan: Plan) -> Result<Cycle> {
                     )?;
                 } else {
                     ensure!(status.is_success(), "附件检查返回 HTTP {}", status.as_u16());
+                    download_asset(&c, &plan, aid)?;
                 }
             }
             let response = c
@@ -924,7 +944,9 @@ pub fn transfer(mut plan: Plan) -> Result<Cycle> {
         );
         for packet in page.items {
             validate(&packet, &plan.config, &plan.key)?;
-            download_assets(&c, &plan, &packet)?;
+            for aid in &packet.header.assets {
+                download_asset(&c, &plan, aid)?;
+            }
             incoming.push(packet);
         }
         cursor = page.cursor;

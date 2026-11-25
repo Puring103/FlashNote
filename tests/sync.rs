@@ -505,12 +505,57 @@ fn remote_image_http_failure_restart_download_and_encrypted_sync() {
 }
 
 #[test]
+fn image_sync_keeps_original_and_reuses_encrypted_copy_on_both_devices() {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+
+    let server = Server::start();
+    let (_temp, mut a, mut b) = pair(&server);
+    let nid = add(&mut a, "图片");
+    let mut original = Vec::new();
+    let image = image::DynamicImage::new_rgba8(180, 260);
+    image
+        .write_with_encoder(PngEncoder::new_with_quality(
+            &mut original,
+            CompressionType::Uncompressed,
+            FilterType::NoFilter,
+        ))
+        .unwrap();
+    original.resize(100 * 1024 * 1024 + 1, 0);
+    let aid = a
+        .attach_prepared(
+            &nid,
+            suojian_core::media::prepare_bytes("image.png".into(), original.clone(), true).unwrap(),
+        )
+        .unwrap();
+    converge(&mut a, &mut b);
+    let copy = b.asset(&aid).unwrap();
+    assert!(copy.len() * 5 <= original.len() * 4);
+    assert_eq!(
+        image::load_from_memory(&copy).unwrap().to_rgba8(),
+        image.to_rgba8()
+    );
+    let cache = |store: &Store| std::fs::read(store.root.join("sync-assets").join(&aid)).unwrap();
+    let wire = cache(&a);
+    assert_ne!(wire, copy);
+    std::fs::remove_file(b.root.join("sync-assets").join(&aid)).unwrap();
+    let mut note = b.notes.iter().find(|n| n.id == nid).unwrap().clone();
+    note.title = "另一台设备编辑".into();
+    b.save_note(note).unwrap();
+    converge(&mut a, &mut b);
+    assert_eq!(cache(&a), wire);
+    assert_eq!(cache(&b), wire);
+    assert_eq!(a.asset(&aid).unwrap(), original);
+    assert_eq!(b.asset(&aid).unwrap(), copy);
+}
+
+#[test]
 fn offline_devices_union_notes_groups_and_encrypted_attachments() {
     let server = Server::start();
     let (_temp, mut a, mut b) = pair(&server);
     let ga = a.create_group_with_color("电脑分组", 0x123456).unwrap();
     let gb = b.create_group_with_color("手机分组", 0x654321).unwrap();
-    let aid = a.import_bytes(b"private attachment A").unwrap();
+    let attachment = b"private attachment A".repeat(4096);
+    let aid = a.import_bytes(&attachment).unwrap();
     let bid = b.import_bytes(b"private attachment B").unwrap();
     let an = add(&mut a, "电脑离线文字");
     let bn = add(&mut b, "手机离线文字");
@@ -537,7 +582,10 @@ fn offline_devices_union_notes_groups_and_encrypted_attachments() {
     assert_eq!(a.groups, b.groups);
     assert_eq!(a.groups[0].id, DEFAULT_GROUP);
     assert_eq!(a.asset(&bid).unwrap(), b"private attachment B");
-    assert_eq!(b.asset(&aid).unwrap(), b"private attachment A");
+    assert_eq!(b.asset(&aid).unwrap(), attachment);
+    let wire = std::fs::read(b.root.join("sync-assets").join(&aid)).unwrap();
+    assert_eq!(wire[0], 2);
+    assert!(wire.len() < attachment.len());
     assert_ne!(a.settings.model_path, b.settings.model_path);
     let usage = sync::usage(&a).unwrap();
     assert_eq!(usage.asset_count, 2);

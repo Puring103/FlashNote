@@ -167,6 +167,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS sync_packets(revision TEXT PRIMARY KEY, packet TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS sync_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
         std::fs::create_dir_all(root.join("sync-assets"))?;
+        std::fs::create_dir_all(root.join("sync-image-receipts"))?;
         let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         let empty: bool =
             db.query_row("SELECT NOT EXISTS(SELECT 1 FROM objects)", [], |r| r.get(0))?;
@@ -517,6 +518,10 @@ impl Store {
         Ok(assets)
     }
     pub fn import_bytes(&self, bytes: &[u8]) -> Result<String> {
+        anyhow::ensure!(
+            bytes.len() as u64 <= crate::media::MAX_FILE,
+            "附件超过 128 MiB"
+        );
         use std::io::Write;
         loop {
             let aid = id();

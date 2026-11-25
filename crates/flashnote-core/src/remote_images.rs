@@ -108,7 +108,7 @@ pub fn download(url: &str) -> Result<media::PreparedAttachment> {
             response
                 .content_length()
                 .is_none_or(|n| n <= media::MAX_FILE),
-            "图片超过 32MB"
+            "图片超过 128 MiB"
         );
         let mut bytes = vec![];
         response.take(media::MAX_FILE + 1).read_to_end(&mut bytes)?;

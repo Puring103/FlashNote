@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlsplit
 from identity import IdentityUnavailable
 from casdoor import Casdoor
 
-MAX_ASSET = 64 * 1024 * 1024
+MAX_ASSET = 128 * 1024 * 1024 + 41  # file limit plus encryption overhead
 MAX_OBJECT = 8 * 1024 * 1024
 PAGE_SIZE = 16
 BROWSE_LIMIT = 20
@@ -166,7 +166,9 @@ class Database:
         db.execute("UPDATE vaults SET used=used+? WHERE id=?", (delta, vault))
 
     def put_asset(self, vault, aid, payload):
-        if len(payload) < 41 or payload[0] != 1:
+        if len(payload) > MAX_ASSET:
+            raise ApiError(413, "attachment too large")
+        if len(payload) < 41 or not (payload[0] == 1 or (len(payload) >= 42 and payload[:2] == b"\x02\x01")):
             raise ApiError(400, "invalid encrypted asset")
         digest = hashlib.sha256(payload).hexdigest()
         with self.connect() as db:
@@ -193,7 +195,9 @@ class Database:
                 or (head["kind"] == "group" and head["assets"])):
             raise ApiError(400, "invalid object header")
         payload = base64.b64decode(envelope["ciphertext"], validate=True)
-        if len(payload) < 41 or payload[0] != 1:
+        if len(payload) > MAX_ASSET:
+            raise ApiError(413, "attachment too large")
+        if len(payload) < 41 or not (payload[0] == 1 or (len(payload) >= 42 and payload[:2] == b"\x02\x01")):
             raise ApiError(400, "invalid ciphertext")
         raw = encode(envelope)
         digest = hashlib.sha256(raw).hexdigest()
@@ -350,7 +354,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parts.path.strip("/").split("/")
         accounts = self.server.accounts
         if self.command == "GET" and path == ["health"]:
-            return self.reply(200, {"ok": True, "version": "0.11.0", "protocol": 3, "authentication": "casdoor"})
+            return self.reply(200, {"ok": True, "version": "0.12.0", "protocol": 3, "authentication": "casdoor"})
         if self.command == "GET" and path == ["auth", "config"]:
             return self.reply(200, {**accounts.configuration(), "account_login": True, "vault_protocol": 1,
                                     "new_vault_encryption": "e2ee" if db.e2ee else "managed",
