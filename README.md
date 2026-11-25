@@ -38,6 +38,8 @@ cp .env.example .env
 
 用 `sudo cat .casdoor/initial-account.json` 查看初始账号和密码，在桌面端「设置 → 账号与同步」或 Android 端「我的」填写服务器地址和凭据。
 
+备份、恢复和升级步骤见[同步服务运维指南](sync-server/README.md)。
+
 ## 许可证
 
 项目原创代码采用 [MIT 许可证](LICENSE)。第三方组件和素材沿用各自的许可。

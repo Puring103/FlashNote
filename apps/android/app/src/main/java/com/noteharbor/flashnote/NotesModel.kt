@@ -1,6 +1,8 @@
 package com.noteharbor.flashnote
 
 import android.app.Application
+import android.net.Uri
+import android.os.SystemClock
 import androidx.compose.runtime.*
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -8,12 +10,17 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.File
+import java.util.UUID
+import kotlin.coroutines.cancellation.CancellationException
 import java.util.concurrent.Executors
 
-data class Attachment(val asset: String, val name: String) {
+data class Attachment(val asset: String, val name: String, val audioBlock: String? = null,
+ val transcript: String? = null, val durationMs: Long = 0) {
  val isImage: Boolean get()=name.substringAfterLast('.').lowercase() in listOf("jpg","jpeg","png","webp","gif")
  val isAudio: Boolean get()=name.substringAfterLast('.').lowercase() in listOf("wav","mp3","m4a","ogg","aac")
 }
+data class NoteRevision(val revision: String, val title: String, val source: String, val updated: Long)
 data class Group(val id: String, val name: String, val color: Long = 0x245356)
 data class Note(val id: String, val revision: String, val title: String, val group: String,
  val source: String, val deleted: Boolean, val created: Long, val conflict: String?, val attachments: List<Attachment> = emptyList())
@@ -30,19 +37,47 @@ class NotesModel(app: Application, preview: Boolean=false) : AndroidViewModel(ap
  var syncing by mutableStateOf(false); private set
  var synced by mutableStateOf(false); private set
  var syncFailed by mutableStateOf(false); private set
+ private var lastSyncAttempt: Long? = null
+ private var syncPending = false
+ private var foregroundSyncRequested = false
  var error by mutableStateOf<String?>(null)
  var lastSavedNote: Note? = null; private set
  var message by mutableStateOf<String?>(null)
+ private var recorder: NoteRecording? = null
+ var recording by mutableStateOf(false); private set
+ var recordingToken by mutableStateOf<String?>(null); private set
  init { send(JSONObject().put("op","list"),prepare={if(BuildConfig.DEBUG && preview) DesignFixtures.seed(app,root)}) }
- fun send(request: JSONObject, prepare: (() -> Unit)? = null, done: () -> Unit = {}) {
+ fun foregroundEntered() { foregroundSyncRequested = true }
+
+ fun sync(automatic: Boolean = false, notify: Boolean = false) {
+  if (busy || account == null) return
+  val elapsed = lastSyncAttempt?.let { SystemClock.elapsedRealtime() - it }
+  val interval = when {
+   foregroundSyncRequested -> 5_000L
+   syncPending -> 10_000L
+   else -> 60_000L
+  }
+  if (automatic && elapsed != null && elapsed < interval) return
+  foregroundSyncRequested = false
+  lastSyncAttempt = SystemClock.elapsedRealtime()
+  send(JSONObject().put("op", "sync"), quiet = automatic) { if (notify) message = "同步完成" }
+ }
+
+ fun send(request: JSONObject, prepare: (() -> Unit)? = null,
+  transferResult: (() -> Unit)? = null, cleanup: (() -> Unit)? = null,
+  details: (Any?) -> Unit = {}, quiet: Boolean = false, done: () -> Unit = {}) {
   if (busy) return
   busy = true
-  syncing = request.optString("op")=="sync"
+  val operation = request.getString("op")
+  syncing = operation == "sync"
   viewModelScope.launch {
    try {
-    val response = withContext(worker) { prepare?.invoke(); JSONObject(Native.request(root,request.toString())) }
-    check(response.getBoolean("ok")) { response.optString("error","操作失败") }
-    val data = response.getJSONObject("data")
+    val data = withContext(worker) {
+     try {
+      prepare?.invoke()
+      nativeRequest(request).also { transferResult?.invoke() }
+     } finally { cleanup?.invoke() }
+    }
     val ns = data.getJSONArray("notes")
     val changed = (0 until ns.length()).map { i ->
      val row=ns.getJSONObject(i); val n=row.getJSONObject("note")
@@ -51,7 +86,12 @@ class NotesModel(app: Application, preview: Boolean=false) : AndroidViewModel(ap
       if(n.isNull("conflict_of") || n.optBoolean("conflict_resolved")) null else n.getString("conflict_of"),
       n.getJSONArray("blocks").let { blocks -> (0 until blocks.length()).map { blocks.getJSONObject(it) }
        .filter { it.has("asset") && it.getString("asset").isNotEmpty() }
-       .map { Attachment(it.getString("asset"),it.optString("name",if(it.optString("kind")=="audio") "录音.wav" else "附件")) } })
+       .map {
+        val audio = it.optString("kind") == "audio"
+        Attachment(it.getString("asset"), it.optString("name", if (audio) "录音.wav" else "附件"),
+         if (audio) it.getString("id") else null, if (it.isNull("text")) null else it.getString("text"),
+         it.optLong("duration_ms"))
+       } })
     }
     if (data.getBoolean("replace_notes")) {
      notes = changed.sortedByDescending { it.created }
@@ -65,18 +105,120 @@ class NotesModel(app: Application, preview: Boolean=false) : AndroidViewModel(ap
     val gs=data.getJSONArray("groups")
     groups=(0 until gs.length()).map { gs.getJSONObject(it) }.filter { !it.optBoolean("deleted") }.map { Group(it.getString("id"),it.getString("name"),it.optLong("color",0x245356)) }
     account=if(data.isNull("account")) null else data.getString("account")
-    when(request.optString("op")) {
+    when(operation) {
      "sync" -> {
       val syncError = if (data.isNull("sync_error")) null else data.getString("sync_error")
       synced = syncError == null
       syncFailed = syncError != null
-      error = syncError
+      syncPending = false
+      if (syncError != null) {
+       if (!quiet) error = syncError
+       return@launch
+      }
      }
-     "login", "logout", "save", "attach", "group", "delete", "restore", "resolve" -> synced=false
+     "login", "logout" -> { synced = false; syncFailed = false; lastSyncAttempt = null }
+     "save", "attach", "group", "delete", "restore", "resolve", "recording", "transcript", "restore_history", "import_zip" -> {
+      synced = false
+      syncPending = true
+     }
     }
+    details(data.opt("details"))
     done()
-   } catch(e: Exception) { if(syncing) syncFailed=true;error=e.message ?: "操作失败，草稿仍保留" }
+   } catch(e: CancellationException) { throw e }
+   catch(e: Exception) {
+    if (syncing) { syncFailed = true; synced = false; syncPending = false }
+    if (!quiet) error = e.message ?: "操作失败，草稿仍保留"
+   }
    finally { busy=false;syncing=false }
+  }
+ }
+
+ private fun nativeRequest(request: JSONObject): JSONObject {
+  val response = JSONObject(Native.request(root, request.toString()))
+  check(response.getBoolean("ok")) { response.optString("error", "操作失败") }
+  return response.getJSONObject("data")
+ }
+
+ fun history(noteId: String, done: (List<NoteRevision>) -> Unit) {
+  send(JSONObject().put("op", "history").put("id", noteId), details = { value ->
+   val rows = value as org.json.JSONArray
+   done(List(rows.length()) { index ->
+    val row = rows.getJSONObject(index)
+    NoteRevision(row.getString("revision"), row.getString("title"), row.getString("source"), row.getLong("updated"))
+   })
+  })
+ }
+
+ fun restoreHistory(note: Note, revision: NoteRevision, done: () -> Unit) = send(JSONObject()
+  .put("op", "restore_history").put("id", note.id).put("revision", note.revision)
+  .put("restore_revision", revision.revision), done = done)
+
+ fun transferZip(uri: Uri, export: Boolean) {
+  val token = UUID.randomUUID().toString()
+  val file = transferFile(token)
+  val resolver = getApplication<Application>().contentResolver
+  send(JSONObject().put("op", if (export) "export_zip" else "import_zip").put("token", token),
+   prepare = {
+    file.parentFile?.mkdirs()
+    if (!export) {
+     checkNotNull(resolver.openInputStream(uri)) { "无法打开 ZIP" }.use { input ->
+      file.outputStream().use { output ->
+       val buffer = ByteArray(64 * 1024)
+       var total = 0L
+       while (true) {
+        val size = input.read(buffer)
+        if (size < 0) break
+        total += size
+        check(total <= 520L * 1024 * 1024) { "ZIP 超过 520 MB" }
+        output.write(buffer, 0, size)
+       }
+      }
+     }
+    }
+   }, transferResult = {
+    if (export) checkNotNull(resolver.openOutputStream(uri, "wt")) { "无法写入 ZIP" }.use { output ->
+     file.inputStream().use { it.copyTo(output) }
+    }
+   }, cleanup = { file.delete() }, details = { count ->
+    message = if (export) "已导出 ZIP" else "已导入 $count 张便签"
+   })
+ }
+
+ fun transferFile(token: String) = File(root, "imports/$token")
+
+ fun startRecording() {
+  if (recording || recordingToken != null || busy) return
+  val token = UUID.randomUUID().toString()
+  try {
+   recorder = NoteRecording(getApplication(), transferFile(token)) { result ->
+    viewModelScope.launch {
+     recorder = null
+     recording = false
+     result.onSuccess { recordingToken = token }.onFailure { error = it.message ?: "录音失败" }
+    }
+   }
+   recording = true
+  } catch (e: Exception) { error = e.message ?: "无法开始录音" }
+ }
+
+ fun stopRecording() { recorder?.stop() }
+
+ fun discardRecording() {
+  recordingToken?.let { transferFile(it).delete() }
+  recordingToken = null
+ }
+
+ fun saveRecording(noteId: String, revision: String, title: String, source: String, group: String,
+  token: String, done: () -> Unit) = send(JSONObject().put("op", "recording")
+  .put("id", noteId).put("revision", revision).put("title", title).put("source", source)
+  .put("group", group).put("token", token), transferResult = { transferFile(token).delete() }) {
+   recordingToken = null
+   done()
+  }
+
+ fun saveTranscript(note: Note, item: Attachment, text: String, done: (Note) -> Unit) {
+  send(JSONObject().put("op", "transcript").put("id", note.id).put("block", item.audioBlock).put("text", text)) {
+   notes.find { it.id == note.id }?.let(done)
   }
  }
  fun save(note: Note?, title: String, source: String, group: String, done: () -> Unit) = send(JSONObject()
@@ -117,5 +259,5 @@ class NotesModel(app: Application, preview: Boolean=false) : AndroidViewModel(ap
    finally {busy=false}
   }
  }
- override fun onCleared() { worker.close(); executor.shutdown(); super.onCleared() }
+ override fun onCleared() { stopRecording(); worker.close(); executor.shutdown(); super.onCleared() }
 }

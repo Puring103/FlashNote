@@ -72,6 +72,15 @@ services:
       init:
         condition: service_completed_successfully
     restart: unless-stopped
+  backup:
+    image: python:3.11-slim
+    profiles: [maintenance]
+    volumes:
+      - ./.env:/backup/.env:ro
+      - ./.casdoor:/backup/casdoor
+      - casdoor-sync-data:/backup/sync
+      - caddy-data:/backup/caddy-data
+      - caddy-config:/backup/caddy-config
 volumes:
   casdoor-sync-data:
   caddy-data:

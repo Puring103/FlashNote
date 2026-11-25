@@ -558,16 +558,11 @@ impl Store {
         Ok(path)
     }
 
-    #[cfg(test)]
     pub fn history(&self, note_id: &str) -> Result<Vec<Note>> {
-        let mut stmt = self.db.prepare("SELECT revision,payload FROM revisions WHERE object_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 40")?;
+        let mut stmt = self.db.prepare("SELECT payload FROM revisions WHERE object_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 40")?;
         let mut notes = vec![];
-        for row in stmt.query_map([note_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })? {
-            let (rev, p) = row?;
-            let _ = rev;
-            notes.push(serde_json::from_slice(&p)?);
+        for row in stmt.query_map([note_id], |r| r.get::<_, Vec<u8>>(0))? {
+            notes.push(serde_json::from_slice(&row?)?);
         }
         Ok(notes)
     }

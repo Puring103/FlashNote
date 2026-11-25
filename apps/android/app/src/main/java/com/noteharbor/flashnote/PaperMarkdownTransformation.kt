@@ -6,6 +6,37 @@ import androidx.compose.ui.text.input.*
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.sp
 
+internal fun formatSelection(value: TextFieldValue, action: String): TextFieldValue {
+ val text = value.text
+ val start = value.selection.min
+ val end = value.selection.max
+ if (action == "bold" || action == "italic") {
+  val marker = if (action == "bold") "**" else "*"
+  val opening = start - marker.length
+  val closing = if (text.startsWith(marker, end)) end else end - marker.length
+  if (opening >= 0 && closing >= start && text.startsWith(marker, opening) && text.startsWith(marker, closing)) {
+   return TextFieldValue(text.replaceRange(opening, closing + marker.length, text.substring(start, closing)),
+    TextRange(opening, closing - marker.length))
+  }
+  return TextFieldValue(text.replaceRange(start, end, marker + text.substring(start, end) + marker),
+   TextRange(start + marker.length, end + marker.length))
+ }
+ val prefix = if (action == "check") "- [ ] " else "- "
+ val first = text.lastIndexOf('\n', start - 1) + 1
+ val endProbe = if (end > start && text[end - 1] == '\n') end - 1 else end
+ val last = text.indexOf('\n', endProbe).let { if (it == -1) text.length else it }
+ val lines = text.substring(first, last).split('\n')
+ val existing = Regex("^[-*] (?:\\[[ xX]\\] )?")
+ val remove = lines.all { line -> existing.find(line)?.value?.length == prefix.length }
+ val updated = lines.joinToString("\n") { line -> (if (remove) "" else prefix) + line.replace(existing, "") }
+ val newText = text.replaceRange(first, last, updated)
+ val range = if (!value.selection.collapsed) TextRange(first, first + updated.length) else {
+  val previousPrefix = existing.find(lines.first())?.value?.length ?: 0
+  TextRange((start + (if (remove) 0 else prefix.length) - previousPrefix).coerceIn(first, first + updated.length))
+ }
+ return TextFieldValue(newText, range)
+}
+
 /** Presentation only: persisted Markdown and cursor offsets remain unchanged. */
 internal class PaperMarkdownTransformation : VisualTransformation {
  override fun filter(text: AnnotatedString): TransformedText {

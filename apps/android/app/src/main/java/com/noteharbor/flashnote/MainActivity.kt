@@ -1,6 +1,10 @@
 package com.noteharbor.flashnote
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.verticalScroll
@@ -34,14 +38,22 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import org.json.JSONObject
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlin.coroutines.cancellation.CancellationException
 
 class MainActivity : ComponentActivity() {
  override fun onCreate(savedInstanceState: Bundle?) {
@@ -59,6 +71,26 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable fun NotesApp(model: NotesModel,initialScreen: String="notes") {
+ val context = LocalContext.current
+ val lifecycle = LocalLifecycleOwner.current.lifecycle
+ var foreground by remember { mutableStateOf(false) }
+ DisposableEffect(lifecycle, model) {
+  val observer = LifecycleEventObserver { _, event ->
+   if (event == Lifecycle.Event.ON_RESUME) { foreground = true; model.foregroundEntered() }
+   if (event == Lifecycle.Event.ON_PAUSE) { foreground = false; model.stopRecording() }
+  }
+  lifecycle.addObserver(observer)
+  onDispose { lifecycle.removeObserver(observer); model.stopRecording() }
+ }
+ val scope = rememberCoroutineScope()
+ var startAfterPermission by remember { mutableStateOf(false) }
+ val requestMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+  startAfterPermission = granted
+  if (!granted) model.error = "允许使用麦克风后即可录音"
+ }
+ LaunchedEffect(foreground, startAfterPermission) {
+  if (foreground && startAfterPermission) { startAfterPermission = false; model.startRecording() }
+ }
  var attachTo by remember { mutableStateOf<Note?>(null) }
  val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
   if(uri!=null) attachTo?.let {model.attach(uri,it)}
@@ -74,28 +106,71 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
  var revision by rememberSaveable { mutableStateOf("") }
  var original by rememberSaveable { mutableStateOf("") }
  var title by rememberSaveable { mutableStateOf("") }
- var source by rememberSaveable { mutableStateOf("") }
+ var body by rememberSaveable(stateSaver = TextFieldValue.Saver) { mutableStateOf(TextFieldValue()) }
+ val source = body.text
  var editGroup by rememberSaveable { mutableStateOf(DEFAULT_GROUP) }
  var showGroup by remember { mutableStateOf(false) }
  var groupName by remember { mutableStateOf("") }
  var groupColor by remember {mutableStateOf(0x245356L)}
  var confirmLeave by remember { mutableStateOf(false) }
+ var revisions by remember { mutableStateOf<List<NoteRevision>?>(null) }
+ var selectedRevision by remember { mutableStateOf<NoteRevision?>(null) }
+ var transcribing by remember { mutableStateOf<String?>(null) }
+ val audioPlayer = remember { EditorAudioPlayer() }
+ val availableTranscription = remember(context) { canTranscribe(context) }
+ DisposableEffect(audioPlayer) { onDispose { audioPlayer.stop() } }
+ LaunchedEffect(foreground, editing) { if (!foreground || !editing) audioPlayer.stop() }
+ val recordingActive = model.recording || model.recordingToken != null
+ val editorBusy = model.busy || recordingActive || transcribing != null
  val dirty=editing && original != title+"\u0000"+source+"\u0000"+editGroup
  fun open(n: Note?) {
-  editId=n?.id ?: ""; revision=n?.revision ?: ""; title=n?.title ?: ""; source=n?.source ?: ""
-  editGroup=n?.group ?: group.ifEmpty { DEFAULT_GROUP }; original=title+"\u0000"+source+"\u0000"+editGroup; editing=true
+  editId=n?.id ?: ""; revision=n?.revision ?: ""; title=n?.title ?: ""; body=TextFieldValue(n?.source ?: "")
+  editGroup=n?.group ?: group.ifEmpty { DEFAULT_GROUP }; original=title+"\u0000"+body.text+"\u0000"+editGroup; editing=true
+ }
+ LaunchedEffect(foreground, editing, model.account) {
+  if (foreground && !editing && model.account != null) {
+   while (true) {
+    model.sync(automatic = true)
+    delay(4_000)
+   }
+  }
  }
  var previewOpened by rememberSaveable {mutableStateOf(false)}
  LaunchedEffect(initialScreen,model.notes) {
   if(initialScreen=="editor" && !previewOpened && model.notes.isNotEmpty()) {previewOpened=true;open(model.notes.first())}
  }
- fun close() { if(dirty) confirmLeave=true else editing=false }
+ fun close() { if(editorBusy) return; if(dirty) confirmLeave=true else editing=false }
  fun save() {
+  if (editorBusy) return
   val baseline=if(editId.isEmpty()) null else Note(editId,revision,title,editGroup,source,false,0,null)
   model.save(baseline,title,source,editGroup) { editing=false; model.message="已保存到本机" }
  }
- LaunchedEffect(editing,title,source,editGroup,model.busy) {
-  if(editing && dirty && !model.busy && model.error==null && (title.isNotBlank() || source.isNotBlank())) {
+ fun commitRecording(copy: Boolean = false) {
+  val token = model.recordingToken ?: return
+  val savedTitle = title; val savedSource = source; val savedGroup = editGroup
+  model.saveRecording(if (copy) "" else editId, revision, savedTitle, savedSource, savedGroup, token) {
+   model.lastSavedNote?.let { note ->
+    editId = note.id; revision = note.revision
+    if (body.text == savedSource) body = TextFieldValue(note.source, TextRange(body.selection.end.coerceIn(0, note.source.length)))
+    original = savedTitle + "\u0000" + (model.lastSavedNote?.source ?: savedSource) + "\u0000" + savedGroup
+   }
+  }
+ }
+ LaunchedEffect(editing, model.recordingToken) {
+  if (editing && !model.busy && model.error == null && model.recordingToken != null) commitRecording()
+ }
+ LaunchedEffect(editId, model.notes) {
+  if (editing && !dirty && !recordingActive && editId.isNotEmpty()) {
+   val updated = model.notes.find { it.id == editId && !it.deleted }
+   if (updated != null && updated.revision != revision) {
+    revision = updated.revision; title = updated.title; editGroup = updated.group
+    body = TextFieldValue(updated.source, TextRange(body.selection.end.coerceIn(0, updated.source.length)))
+    original = title + "\u0000" + updated.source + "\u0000" + editGroup
+   }
+  }
+ }
+ LaunchedEffect(editing,title,source,editGroup,editorBusy) {
+  if(editing && dirty && !editorBusy && model.error==null && (title.isNotBlank() || source.isNotBlank())) {
    delay(1200)
    val savedTitle=title;val savedSource=source;val savedGroup=editGroup
    val baseline=if(editId.isEmpty()) null else Note(editId,revision,title,editGroup,source,false,0,null)
@@ -122,13 +197,13 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
       }
       Spacer(Modifier.weight(1f))
       Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(4.dp)) {if(!dirty && !model.busy) LineIcon("tick",modifier=Modifier.size(14.dp));Text(if(model.busy) "保存中…" else if(dirty) "未保存" else "已保存",fontSize=11.sp,color=Muted)}
-      TextButton(enabled=!model.busy,onClick={save()}) {Text("完成")}
+      TextButton(enabled=!editorBusy,onClick={save()}) {Text("完成")}
      } else {
       Text(if(settings) "我的" else if(page=="groups") "分组" else if(trash) "回收站" else "索笺",fontFamily=FontFamily.SansSerif,fontWeight=FontWeight.Bold,fontSize=26.sp,color=Ink)
       Spacer(Modifier.weight(1f))
       if(page=="groups" && !settings) TextButton(onClick={showGroup=true}) {LineIcon("plus",modifier=Modifier.size(17.dp));Text(" 新建分组")}
       else if(!settings) {
-       IconButton(enabled=!model.busy,onClick={if(model.account!=null) model.send(JSONObject().put("op","sync")) else {settings=true;page="me"}},modifier=Modifier.size(44.dp)) {
+       IconButton(enabled=!model.busy,onClick={if(model.account!=null) model.sync() else {settings=true;page="me"}},modifier=Modifier.size(44.dp)) {
         Box(contentAlignment=Alignment.Center) {
          LineIcon(if(model.synced) "cloud-check" else "cloud",when {model.syncing->"正在同步";model.account==null->"未登录，点击登录";model.syncFailed->"同步失败，点击重试";model.synced->"已同步，点击再次同步";else->"已登录，点击同步"},modifier=Modifier.size(23.dp),color=if(model.syncFailed) Color(0xFFB4473B) else if(model.account==null) Muted else Ink)
          if(model.syncing) CircularProgressIndicator(Modifier.size(32.dp),color=Ink,strokeWidth=1.dp)
@@ -161,17 +236,59 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
      Spacer(Modifier.height(12.dp))
      BasicTextField(title,{title=it},textStyle=TextStyle(fontSize=25.sp,fontWeight=FontWeight.Bold,color=TextInk),cursorBrush=SolidColor(Ink),modifier=Modifier.fillMaxWidth(),decorationBox={inner -> if(title.isEmpty()) Text("无标题便签",fontSize=25.sp,color=Muted);inner()})
      Row(Modifier.padding(top=12.dp,bottom=20.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {LineIcon("calendar",modifier=Modifier.size(15.dp),color=Muted);Text(SimpleDateFormat("yyyy年M月d日  EEEE",Locale.CHINA).format(Date(model.notes.find {it.id==editId}?.created ?: System.currentTimeMillis())),fontSize=12.sp,color=Muted)}
-     BasicTextField(source,{source=it},visualTransformation=remember {PaperMarkdownTransformation()},textStyle=TextStyle(fontSize=16.sp,lineHeight=27.sp,color=TextInk),cursorBrush=SolidColor(Ink),modifier=Modifier.fillMaxWidth().heightIn(min=140.dp),decorationBox={inner -> if(source.isEmpty()) Text("写下此刻的想法…",color=Muted,fontSize=17.sp);inner()})
-     model.notes.find {it.id==editId}?.attachments?.forEach {a ->
+     BasicTextField(body,{body=it},visualTransformation=remember {PaperMarkdownTransformation()},textStyle=TextStyle(fontSize=16.sp,lineHeight=27.sp,color=TextInk),cursorBrush=SolidColor(Ink),modifier=Modifier.fillMaxWidth().heightIn(min=140.dp),readOnly=recordingActive,decorationBox={inner -> if(source.isEmpty()) Text("写下此刻的想法…",color=Muted,fontSize=17.sp);inner()})
+     val editedNote = model.notes.find { it.id == editId }
+     editedNote?.attachments?.forEach {a ->
       if(a.isImage) NoteThumbnail(a,root=model.assetRoot,modifier=Modifier.fillMaxWidth().height(180.dp)) {model.openAttachment(a)}
-      else TextButton(onClick={model.openAttachment(a)}) {LineIcon("file");Text("  "+a.name)}
+      else if (a.audioBlock != null) {
+       Row(verticalAlignment = Alignment.CenterVertically) {
+        val playing = audioPlayer.playing == a.asset
+        TextButton(enabled = !editorBusy, onClick = {
+         runCatching { audioPlayer.toggle(model.assetRoot, a.asset) }.onFailure { model.error = "无法播放录音" }
+        }) { LineIcon(if (playing) "stop" else "play"); Text(if (playing) "  停止播放" else "  播放录音") }
+        val seconds = a.durationMs / 1000
+        Text("%d:%02d".format(seconds / 60, seconds % 60), fontSize = 12.sp, color = Muted)
+        if (a.transcript == null && availableTranscription) TextButton(enabled = !editorBusy, onClick = {
+         audioPlayer.stop()
+         transcribing = a.asset
+         scope.launch {
+          try {
+           val text = transcribe(context, model.assetRoot.resolve(a.asset))
+           model.saveTranscript(editedNote, a, text) { updated -> revision = updated.revision }
+          } catch (e: CancellationException) { throw e }
+          catch (e: Exception) { model.error = e.message ?: "转写失败，录音已保留" }
+          finally { transcribing = null }
+         }
+        }) { Text(if (transcribing == a.asset) "正在转写…" else "离线转写") }
+       }
+       a.transcript?.let { Text(it, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp), color = TextInk) }
+      }
+      else TextButton(enabled = !editorBusy, onClick={model.openAttachment(a)}) {LineIcon("file");Text("  "+a.name)}
+     }
+     if (model.recordingToken != null && !model.busy) Row {
+      TextButton(onClick = { model.error = null; commitRecording() }) { Text("保存录音") }
+      if (editId.isNotEmpty()) TextButton(onClick = { model.error = null; commitRecording(copy = true) }) { Text("另存为新便签") }
+      TextButton(onClick = { model.discardRecording() }) { Text("丢弃此录音") }
      }
      Spacer(Modifier.height(32.dp))
     }
     HorizontalDivider(color=Edge)
     Row(Modifier.fillMaxWidth().navigationBarsPadding().horizontalScroll(rememberScrollState()).padding(horizontal=16.dp),verticalAlignment=Alignment.CenterVertically) {
-     listOf("bold" to "**文字**","italic" to "*文字*","check" to "\n- [ ] 待办事项","list" to "\n- 列表内容").forEach {(icon,insert) -> QuietAction(icon,when(icon){"bold"->"加粗";"italic"->"斜体";"check"->"待办";else->"列表"}) {source+=insert}}
-     IconButton(enabled=!model.busy && editId.isNotEmpty(),onClick={attachTo=model.notes.find {it.id==editId};picker.launch(arrayOf("*/*"))}) {LineIcon("image","添加图片或附件")}
+     listOf("bold" to "加粗", "italic" to "斜体", "check" to "待办", "list" to "列表").forEach { (icon, label) ->
+      IconButton(enabled = !recordingActive, onClick = { body = formatSelection(body, icon) }) { LineIcon(icon, label) }
+     }
+     IconButton(enabled=!editorBusy && editId.isNotEmpty() && !dirty,onClick={attachTo=model.notes.find {it.id==editId};picker.launch(arrayOf("*/*"))}) {LineIcon("image","添加图片或附件")}
+     IconButton(enabled = model.recording || !editorBusy, onClick = {
+      if (model.recording) model.stopRecording()
+      else {
+       audioPlayer.stop()
+       if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) model.startRecording()
+       else requestMic.launch(Manifest.permission.RECORD_AUDIO)
+      }
+     }) { LineIcon(if (model.recording) "stop" else "mic", if (model.recording) "停止录音" else "录音") }
+     IconButton(enabled = !editorBusy && !dirty && editId.isNotEmpty(), onClick = {
+      model.history(editId) { rows -> revisions = rows.filter { it.revision != revision } }
+     }) { LineIcon("history", "历史版本") }
     }
    } else if(settings) AccountSettings(model)
    else if(page=="groups") {
@@ -236,6 +353,31 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
   }
  }
 
+ revisions?.let { entries ->
+  if (selectedRevision == null) AlertDialog(onDismissRequest = { revisions = null }, title = { Text("历史版本") }, text = {
+   if (entries.isEmpty()) Text("这台设备暂无更早的版本")
+   else LazyColumn(Modifier.heightIn(max = 360.dp)) {
+    items(entries, key = { it.revision }) { entry ->
+     TextButton(onClick = { selectedRevision = entry }) {
+      Text(SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(entry.updated)) + "  " + entry.title.ifBlank { "无标题便签" })
+     }
+    }
+   }
+  }, confirmButton = { TextButton(onClick = { revisions = null }) { Text("关闭") } })
+ }
+ selectedRevision?.let { entry ->
+  AlertDialog(onDismissRequest = { selectedRevision = null }, title = { Text(entry.title.ifBlank { "无标题便签" }) },
+   text = { Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) { NoteExcerpt(entry.source, limit = Int.MAX_VALUE) } },
+   confirmButton = { TextButton(enabled = !editorBusy, onClick = {
+    model.notes.find { it.id == editId && it.revision == revision }?.let { note ->
+     model.restoreHistory(note, entry) {
+      model.lastSavedNote?.let { open(it) }
+      selectedRevision = null; revisions = null
+     }
+    } ?: run { model.error = "便签已更新，请重新打开历史版本" }
+   }) { Text("恢复此版本") } }, dismissButton = { TextButton(onClick = { selectedRevision = null }) { Text("返回") } })
+ }
+
  if(showGroup) AlertDialog(onDismissRequest={showGroup=false},title={Text("新建分组")},text={Column(verticalArrangement=Arrangement.spacedBy(16.dp)) {
   OutlinedTextField(groupName,{groupName=it},label={Text("名称")},singleLine=true)
   Text("索引颜色",fontSize=13.sp,color=Muted)
@@ -252,6 +394,13 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
 }
 
 @Composable private fun AccountSettings(model: NotesModel) {
+ var pendingUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+ var pendingExport by rememberSaveable { mutableStateOf(false) }
+ val importZip = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> pendingExport = false; pendingUri = uri }
+ val exportZip = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri -> pendingExport = true; pendingUri = uri }
+ LaunchedEffect(pendingUri, model.busy) {
+  if (!model.busy) pendingUri?.let { uri -> pendingUri = null; model.transferZip(uri, export = pendingExport) }
+ }
  var serverAddress by rememberSaveable { mutableStateOf("") }
  var username by rememberSaveable { mutableStateOf("") }
  val uriHandler = LocalUriHandler.current
@@ -275,11 +424,21 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
      }) { Text("查看服务器部署指南") }
      OutlinedTextField(username,{username=it},label={Text("账号")},singleLine=true,shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth())
      OutlinedTextField(password,{password=it},label={Text("密码")},singleLine=true,visualTransformation=PasswordVisualTransformation(),shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth())
-     Button(enabled=!model.busy && serverAddress.isNotBlank() && username.isNotBlank() && password.isNotBlank(),shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth().height(44.dp),onClick={model.send(JSONObject().put("op","login").put("url",serverAddress.trim()).put("username",username.trim()).put("password",password)) {password="";model.message="登录成功，点击立即同步获取便签"}}) {Text(if(model.busy) "正在登录…" else "登录")}
+     Button(enabled=!model.busy && serverAddress.isNotBlank() && username.isNotBlank() && password.isNotBlank(),shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth().height(44.dp),onClick={model.send(JSONObject().put("op","login").put("url",serverAddress.trim()).put("username",username.trim()).put("password",password)) {password=""}}) {Text(if(model.busy) "正在登录…" else "登录")}
     } else {
      Text(when {model.syncing->"正在同步便签…";model.syncFailed->"同步未完成，请重试";model.synced->"便签已同步";else->"便签已保存在本机"},fontSize=13.sp,color=Muted)
-     Button(enabled=!model.busy,shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth(),onClick={model.send(JSONObject().put("op","sync")) {model.message="同步完成"}}) {Text("立即同步")}
+     Button(enabled=!model.busy,shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth(),onClick={model.sync(notify = true)}) {Text("立即同步")}
      TextButton(enabled=!model.busy,onClick={model.send(JSONObject().put("op","logout"))}) {Text("退出登录")}
+    }
+   }
+  }
+  Surface(shape = RoundedCornerShape(8.dp), color = CardPaper, border = BorderStroke(1.dp, Edge)) {
+   Column(Modifier.fillMaxWidth().padding(18.dp)) {
+    Text("便签导入与导出", fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
+    Text("ZIP 含明文便签与附件。同 ID 的便签导入时保留为副本。", color = Muted, fontSize = 13.sp)
+    Row {
+     TextButton(enabled = !model.busy, onClick = { importZip.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) }) { Text("导入 ZIP") }
+     TextButton(enabled = !model.busy, onClick = { exportZip.launch("FlashNote.zip") }) { Text("导出 ZIP") }
     }
    }
   }
