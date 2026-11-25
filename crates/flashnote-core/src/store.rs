@@ -11,7 +11,7 @@ pub struct StoreBusy;
 
 impl std::fmt::Display for StoreBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("此资料目录已被另一个进程打开，请先退出使用它的索笺或同步工具")
+        f.write_str("此资料目录已被另一个进程打开，请先退出使用它的闪记或同步工具")
     }
 }
 
@@ -33,6 +33,7 @@ pub struct Store {
     pub settings: Settings,
     pub device: String,
     // Drop this last: one owner process also serializes token rotation.
+    pub(crate) profile: Option<(PathBuf, std::sync::Arc<std::fs::File>)>,
     _directory_lock: std::fs::File,
 }
 impl Store {
@@ -183,6 +184,7 @@ impl Store {
             d
         };
         let mut store = Self {
+            profile: None,
             _directory_lock: directory_lock,
             db,
             key,

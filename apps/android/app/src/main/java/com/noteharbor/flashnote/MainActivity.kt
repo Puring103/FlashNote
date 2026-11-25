@@ -199,7 +199,7 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
       Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(4.dp)) {if(!dirty && !model.busy) LineIcon("tick",modifier=Modifier.size(14.dp));Text(if(model.busy) "保存中…" else if(dirty) "未保存" else "已保存",fontSize=11.sp,color=Muted)}
       TextButton(enabled=!editorBusy,onClick={save()}) {Text("完成")}
      } else {
-      Text(if(settings) "我的" else if(page=="groups") "分组" else if(trash) "回收站" else "索笺",fontFamily=FontFamily.SansSerif,fontWeight=FontWeight.Bold,fontSize=26.sp,color=Ink)
+      Text(if(settings) "我的" else if(page=="groups") "分组" else if(trash) "回收站" else "闪记",fontFamily=FontFamily.SansSerif,fontWeight=FontWeight.Bold,fontSize=26.sp,color=Ink)
       Spacer(Modifier.weight(1f))
       if(page=="groups" && !settings) TextButton(onClick={showGroup=true}) {LineIcon("plus",modifier=Modifier.size(17.dp));Text(" 新建分组")}
       else if(!settings) {
@@ -404,6 +404,26 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
  var serverAddress by rememberSaveable { mutableStateOf("") }
  var username by rememberSaveable { mutableStateOf("") }
  val uriHandler = LocalUriHandler.current
+ var allowManaged by remember { mutableStateOf(false) }
+ var revealed by remember { mutableStateOf<String?>(null) }
+ var askImport by remember { mutableStateOf(false) }
+ if(askImport && revealed==null) {
+  AlertDialog(onDismissRequest={askImport=false},title={Text("将本地便签导入当前账号？")},
+   confirmButton={TextButton(onClick={askImport=false;model.send(JSONObject().put("op","import_local"))}) {Text("导入")}},
+   dismissButton={TextButton(onClick={askImport=false}) {Text("暂不导入")}})
+ }
+ var recoveryInput by remember { mutableStateOf("") }
+
+ val clipboard = LocalContext.current.getSystemService(android.content.ClipboardManager::class.java)
+ revealed?.let { words ->
+  AlertDialog(onDismissRequest={revealed=null},title={Text("保存助记词")},properties=androidx.compose.ui.window.DialogProperties(securePolicy=androidx.compose.ui.window.SecureFlagPolicy.SecureOn),
+   text={Text("服务器仅保存便签和附件密文。新设备需要助记词；失去全部已授权设备和助记词后，云端内容无法恢复。\n\n$words")},
+   confirmButton={TextButton(onClick={val clip = android.content.ClipData.newPlainText("助记词", words)
+     clip.description.extras = android.os.PersistableBundle().apply { putBoolean("android.content.extra.IS_SENSITIVE", true) }
+     clipboard.setPrimaryClip(clip)
+     revealed=null}) {Text("复制")}},
+   dismissButton={TextButton(onClick={revealed=null}) {Text("关闭")}})
+ }
  var password by remember { mutableStateOf("") }
  Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal=20.dp,vertical=16.dp),verticalArrangement=Arrangement.spacedBy(20.dp)) {
   Surface(shape=RoundedCornerShape(8.dp),color=CardPaper,border=BorderStroke(1.dp,Edge)) {
@@ -424,10 +444,17 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
      }) { Text("查看服务器部署指南") }
      OutlinedTextField(username,{username=it},label={Text("账号")},singleLine=true,shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth())
      OutlinedTextField(password,{password=it},label={Text("密码")},singleLine=true,visualTransformation=PasswordVisualTransformation(),shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth())
-     Button(enabled=!model.busy && serverAddress.isNotBlank() && username.isNotBlank() && password.isNotBlank(),shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth().height(44.dp),onClick={model.send(JSONObject().put("op","login").put("url",serverAddress.trim()).put("username",username.trim()).put("password",password)) {password=""}}) {Text(if(model.busy) "正在登录…" else "登录")}
+     Row(verticalAlignment=Alignment.CenterVertically) { Checkbox(checked=allowManaged,onCheckedChange={allowManaged=it}); Text("允许托管模式（服务器可解密）") }
+     OutlinedTextField(recoveryInput,{recoveryInput=it},label={Text("助记词（首次建库可留空）")},singleLine=true,visualTransformation=PasswordVisualTransformation(),modifier=Modifier.fillMaxWidth())
+     Button(enabled=!model.busy && serverAddress.isNotBlank() && username.isNotBlank() && password.isNotBlank(),shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth().height(44.dp),onClick={model.send(JSONObject().put("op","login").put("url",serverAddress.trim()).put("username",username.trim()).put("password",password).put("words",recoveryInput).put("allow_managed",allowManaged),details={revealed=it as? String}) {password=""; recoveryInput=""; allowManaged=false; askImport=model.hasLocal}}) {Text(if(model.busy) "正在登录…" else "登录")}
     } else {
      Text(when {model.syncing->"正在同步便签…";model.syncFailed->"同步未完成，请重试";model.synced->"便签已同步";else->"便签已保存在本机"},fontSize=13.sp,color=Muted)
      Button(enabled=!model.busy,shape=RoundedCornerShape(6.dp),modifier=Modifier.fillMaxWidth(),onClick={model.sync(notify = true)}) {Text("立即同步")}
+     if(model.hasLocal) TextButton(onClick={askImport=true}) {Text("导入本地便签")}
+     if(model.e2ee) {
+      Text("端到端加密")
+      TextButton(enabled=!model.busy,onClick={model.send(JSONObject().put("op","recovery_words"),details={revealed=it as? String})}) {Text("查看 / 复制助记词")}
+     } else Text("此资料库使用服务器托管密钥。")
      TextButton(enabled=!model.busy,onClick={model.send(JSONObject().put("op","logout"))}) {Text("退出登录")}
     }
    }
@@ -442,7 +469,7 @@ private const val DEFAULT_GROUP="00000000-0000-0000-0000-000000000000"
     }
    }
   }
-  Text("索笺  /  Android",fontSize=12.sp,color=Muted)
+  Text("闪记  /  Android",fontSize=12.sp,color=Muted)
   Text("便签保存在本机，卸载前请完成同步。",fontSize=12.sp,lineHeight=20.sp,color=Muted)
  }
 }

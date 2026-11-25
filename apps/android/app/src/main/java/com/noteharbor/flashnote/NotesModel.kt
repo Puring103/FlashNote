@@ -29,9 +29,12 @@ class NotesModel(app: Application, preview: Boolean=false) : AndroidViewModel(ap
  private val executor = Executors.newSingleThreadExecutor()
  private val worker = executor.asCoroutineDispatcher()
  private val root = app.filesDir.resolve(if(BuildConfig.DEBUG && preview) "design-preview-v2" else "vault").absolutePath
- val assetRoot get()=java.io.File(root,"assets")
+ private var storageRoot by mutableStateOf(root)
+ var hasLocal by mutableStateOf(false); private set
+ val assetRoot get()=java.io.File(storageRoot,"assets")
  var notes by mutableStateOf(emptyList<Note>()); private set
  var groups by mutableStateOf(emptyList<Group>()); private set
+ var e2ee by mutableStateOf(false); private set
  var account by mutableStateOf<String?>(null); private set
  var busy by mutableStateOf(false); private set
  var syncing by mutableStateOf(false); private set
@@ -78,6 +81,8 @@ class NotesModel(app: Application, preview: Boolean=false) : AndroidViewModel(ap
       nativeRequest(request).also { transferResult?.invoke() }
      } finally { cleanup?.invoke() }
     }
+    storageRoot=data.getString("storage_root")
+    hasLocal=data.getBoolean("has_local")
     val ns = data.getJSONArray("notes")
     val changed = (0 until ns.length()).map { i ->
      val row=ns.getJSONObject(i); val n=row.getJSONObject("note")
@@ -104,6 +109,7 @@ class NotesModel(app: Application, preview: Boolean=false) : AndroidViewModel(ap
     if (!data.isNull("saved_id")) lastSavedNote = changed.find { it.id == data.getString("saved_id") }
     val gs=data.getJSONArray("groups")
     groups=(0 until gs.length()).map { gs.getJSONObject(it) }.filter { !it.optBoolean("deleted") }.map { Group(it.getString("id"),it.getString("name"),it.optLong("color",0x245356)) }
+    e2ee=data.optBoolean("e2ee")
     account=if(data.isNull("account")) null else data.getString("account")
     when(operation) {
      "sync" -> {
@@ -233,7 +239,7 @@ class NotesModel(app: Application, preview: Boolean=false) : AndroidViewModel(ap
    if(cursor.moveToFirst() && i>=0) name=cursor.getString(i)
   }
   send(JSONObject().put("op","attach").put("id",note.id).put("revision",note.revision).put("token",token).put("name",name),prepare={
-   val directory=java.io.File(root,"imports").apply {mkdirs()}; val file=java.io.File(directory,token)
+   val directory=java.io.File(storageRoot,"imports").apply {mkdirs()}; val file=java.io.File(directory,token)
    try {
     app.contentResolver.openInputStream(uri)!!.use { input -> file.outputStream().use { output ->
      val buffer=ByteArray(8192); var total=0L

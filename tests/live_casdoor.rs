@@ -8,9 +8,18 @@ use std::{
 };
 use suojian::{auth, model::Note, store::Store, sync};
 
-fn sign_in(store: &mut Store, url: &str, secret: &str) {
+fn sign_in(store: &mut Store, url: &str, secret: &str, words: &str) {
     let username = std::env::var("SUOJIAN_SYNC_USERNAME").expect("set login account");
-    let connection = sync::login(url, &username, secret, Arc::new(AtomicBool::new(false))).unwrap();
+    let connection = sync::login_device(
+        &store.root,
+        words,
+        true,
+        url,
+        &username,
+        secret,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
     sync::connect_account(store, connection).unwrap();
 }
 
@@ -26,14 +35,24 @@ fn deployed_login_and_two_device_encrypted_sync() {
     );
     std::fs::create_dir_all(&root).unwrap();
     let mut a = test_store::open_store(root.join("device-a")).unwrap();
-    sign_in(&mut a, &url, &secret);
+    let words = zeroize::Zeroizing::new(std::env::var("SUOJIAN_SYNC_WORDS").unwrap_or_default());
+    sign_in(&mut a, &url, &secret, &words);
     let mut note = Note::new();
     note.set_markdown("真实账号登录与双设备同步验收".into());
     let nid = note.id.clone();
     a.save_note(note).unwrap();
     sync::once(&mut a).unwrap();
     let mut b = test_store::open_store(root.join("device-b")).unwrap();
-    sign_in(&mut b, &url, &secret);
+    let recovery = sync::config(&a)
+        .unwrap()
+        .filter(|c| c.e2ee)
+        .map(|_| sync::recovery_words(&a).unwrap());
+    sign_in(
+        &mut b,
+        &url,
+        &secret,
+        recovery.as_ref().map(|w| w.as_str()).unwrap_or(""),
+    );
     for _ in 0..3 {
         sync::once(&mut b).unwrap();
         sync::once(&mut a).unwrap();
@@ -60,7 +79,13 @@ fn deployed_login_and_two_device_encrypted_sync() {
         .build()
         .unwrap();
     let session = auth::refresh(&client, &current.session).unwrap();
-    let renewed = sync::account_with_session(&url, session).unwrap();
+    let renewed = sync::Connection {
+        config: sync::Config {
+            session,
+            ..current.clone()
+        },
+        key: suojian::crypto::VaultKey(zeroize::Zeroizing::new(*a.key.0)),
+    };
     sync::connect_account(&mut a, renewed).unwrap();
     let test_notes: Vec<_> = a
         .notes

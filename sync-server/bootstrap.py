@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import re
 import secrets
+import sqlite3
+from contextlib import closing
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
 
@@ -43,7 +45,7 @@ def parse_origin(value):
     return 'https://' + parsed.netloc.lower(), is_ip
 
 
-def proxy_config(origin, is_ip, *, managed=False):
+def proxy_config(origin, is_ip, *, managed=False, registration=False):
     template = (Path(__file__).resolve().parent / 'Caddyfile.fragment').read_text(encoding='utf-8')
     tls = '''
     tls {
@@ -55,12 +57,18 @@ def proxy_config(origin, is_ip, *, managed=False):
     site = (template.replace('SYNC_ORIGIN', origin).replace('\n    SYNC_TLS', tls)
             .replace('SYNC_UPSTREAM', 'sync:47831' if managed else '127.0.0.1:47831')
             .replace('CASDOOR_UPSTREAM', 'casdoor:8000' if managed else '127.0.0.1:19000'))
+    if not registration:
+        site = site.replace('    @sync path', '    @signup path /signup /signup/* /api/signup /api/webauthn/signup/*\n    handle @signup {\n        respond 403\n    }\n    @sync path')
     if managed and is_ip:
         return '{\n    default_sni ' + urlsplit(origin).hostname + '\n}\n\n' + site
     return site
 
 
 def bootstrap(state, env):
+    setting = env.get("SUOJIAN_REGISTRATION", "false").lower()
+    if setting not in ("true", "false"):
+        raise ValueError("SUOJIAN_REGISTRATION must be true or false")
+    registration = setting == "true"
     origin, is_ip = parse_origin(env.get('SUOJIAN_ORIGIN', ''))
     if origin != env['SUOJIAN_ORIGIN']:
         raise ValueError(f'Use the canonical origin {origin} in .env.')
@@ -92,12 +100,12 @@ def bootstrap(state, env):
     if not account_path.exists():
         write_private(account_path, json.dumps({'username': 'suojian', 'password': secrets.token_urlsafe(24)}))
     account = json.loads(account_path.read_text())
-    organization = {'owner': 'admin', 'name': 'noteharbor', 'displayName': 'NoteHarbor',
+    organization = {'owner': 'admin', 'name': 'noteharbor', 'displayName': '闪记',
                     'websiteUrl': origin, 'passwordType': 'bcrypt', 'passwordOptions': ['AtLeast8'],
                     'defaultApplication': 'suojian', 'languages': ['zh', 'en'],
                     'accountItems': [{'name': name, 'visible': True, 'viewRule': 'Self', 'modifyRule': 'Self'}
                                      for name in ('Display name', 'Password', 'Email', '3rd-party logins')]}
-    application = {'owner': 'admin', 'name': 'suojian', 'displayName': '索笺',
+    application = {'owner': 'admin', 'name': 'suojian', 'displayName': '闪记',
                    'organization': 'noteharbor', 'cert': 'cert-built-in',
                    'clientId': 'suojian', 'clientSecret': client_path.read_text(encoding='utf-8'),
                    'enablePassword': True, 'enableSignUp': False,
@@ -109,8 +117,29 @@ def bootstrap(state, env):
     seed = seed if seed is not None else {
         'organizations': [organization], 'applications': [application],
         'users': [{'owner': 'noteharbor', 'name': account['username'],
-                   'displayName': '索笺', 'type': 'normal-user', 'password': account['password']}],
+                   'displayName': '闪记', 'type': 'normal-user', 'password': account['password']}],
     }
+    application = next(a for a in seed['applications'] if a['clientId'] == 'suojian')
+    application['enableSignUp'] = registration
+    application['displayName'] = '闪记'
+    for item in seed.get('organizations', []) + seed.get('users', []):
+        if item.get('displayName') in ('索笺', 'NoteHarbor') and item.get('name') in ('noteharbor', 'suojian'):
+            item['displayName'] = '闪记'
+    items = [{'name': name, 'visible': name != 'ID', 'required': True,
+              'rule': 'Random' if name == 'ID' else 'None'}
+             for name in ('ID', 'Username', 'Password', 'Confirm password')]
+    if not application.get('signupItems'):
+        application['signupItems'] = items
+    # initDataNewOnly deliberately preserves existing accounts. Update only our app's policy.
+    db_path = data / 'casdoor.db'
+    if db_path.exists():
+        with closing(sqlite3.connect(db_path)) as db, db:
+            db.execute("""UPDATE application SET display_name='闪记', enable_sign_up=?,
+                signup_items=CASE WHEN signup_items IS NULL OR signup_items IN ('','null','[]')
+                THEN ? ELSE signup_items END WHERE owner='admin' AND client_id='suojian'""",
+                       (registration, json.dumps(items)))
+            db.execute("UPDATE organization SET display_name='闪记' WHERE name='noteharbor' AND owner='admin' AND display_name IN ('索笺','NoteHarbor')")
+            db.execute("UPDATE user SET display_name=replace(display_name,'索笺','闪记') WHERE owner='noteharbor' AND name='suojian' AND display_name IN ('索笺','索笺开发账号')")
     if config is not None:
         config = re.sub(r'^initDataFile\s*=.*$', 'initDataFile = /conf/init_data.json', config, flags=re.M)
     else:
@@ -131,10 +160,19 @@ initDataNewOnly = true
 frontendBaseDir = ./web/build
 logConfig = {{"adapter":"console"}}
 '''
-    write_private(init_data, json.dumps(seed, ensure_ascii=False, indent=2), uid=1000)
+    # Replace the seed atomically, preserving permissions and existing secrets.
+    with NamedTemporaryFile(mode='w', encoding='utf-8', dir=casdoor, delete=False) as stream:
+        json.dump(seed, stream, ensure_ascii=False, indent=2)
+        temporary_seed = Path(stream.name)
+    try:
+        if os.name != 'nt':
+            os.chown(temporary_seed, 1000, 1000)
+        temporary_seed.replace(init_data)
+    finally:
+        temporary_seed.unlink(missing_ok=True)
     write_private(app_conf, config, uid=1000)
-    (state / 'Caddyfile').write_text(proxy_config(origin, is_ip), encoding='utf-8')
-    (caddy / 'Caddyfile').write_text(proxy_config(origin, is_ip, managed=True), encoding='utf-8')
+    (state / 'Caddyfile').write_text(proxy_config(origin, is_ip, registration=registration), encoding='utf-8')
+    (caddy / 'Caddyfile').write_text(proxy_config(origin, is_ip, managed=True, registration=registration), encoding='utf-8')
 
 
 if __name__ == '__main__':

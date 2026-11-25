@@ -15,7 +15,7 @@ fn demo(root: PathBuf, url: &str) -> Result<()> {
         "演示目录必须为空"
     );
     let mut a = Store::open(root.join("device-a"))?;
-    login(&mut a, url)?;
+    login(&mut a, url, None)?;
     let mut shared = Note::new();
     shared
         .set_markdown("电脑离线后会修改这里\n\n中间的内容保持不变\n\n手机离线后会修改这里".into());
@@ -27,7 +27,11 @@ fn demo(root: PathBuf, url: &str) -> Result<()> {
     a.save_note(conflict)?;
     sync::once(&mut a)?;
     let mut b = Store::open(root.join("device-b"))?;
-    login(&mut b, url)?;
+    let recovery = sync::config(&a)?
+        .filter(|c| c.e2ee)
+        .map(|_| sync::recovery_words(&a))
+        .transpose()?;
+    login(&mut b, url, recovery.as_ref().map(|w| w.as_str()))?;
     sync::once(&mut b)?;
     for (store, merged_text, conflicting_text, new_text, attachment_name, attachment) in [
         (
@@ -79,15 +83,24 @@ fn demo(root: PathBuf, url: &str) -> Result<()> {
     Ok(())
 }
 
-fn login(store: &mut Store, url: &str) -> Result<()> {
+fn login(store: &mut Store, url: &str, recovery: Option<&str>) -> Result<()> {
     let username = std::env::var("SUOJIAN_SYNC_USERNAME")
         .context("请设置 SUOJIAN_SYNC_USERNAME（登录账号）")?;
     let secret = zeroize::Zeroizing::new(
         std::env::var("SUOJIAN_SYNC_LOGIN_SECRET")
             .context("请设置 SUOJIAN_SYNC_LOGIN_SECRET（登录密码）")?,
     );
-    let connection = sync::login(url, &username, &secret, Arc::new(AtomicBool::new(false)))?;
-    sync::connect_account(store, connection)
+    let words = zeroize::Zeroizing::new(std::env::var("SUOJIAN_SYNC_WORDS").unwrap_or_default());
+    let connection = sync::login_device(
+        &suojian::profiles::credentials(store)?,
+        recovery.unwrap_or(&words),
+        std::env::var("SUOJIAN_ALLOW_MANAGED").as_deref() == Ok("true"),
+        url,
+        &username,
+        &secret,
+        Arc::new(AtomicBool::new(false)),
+    )?;
+    suojian::profiles::connect(store, connection)
 }
 
 fn main() -> Result<()> {
@@ -99,7 +112,7 @@ fn main() -> Result<()> {
         .into();
     let Some(command) = args.first().map(String::as_str) else {
         bail!(
-            "用法: suojian-sync login <URL> | logout | once | status | demo <URL> | cases | verify-demo"
+            "用法: suojian-sync login <URL> | recovery-words | logout | once | status | demo <URL> | cases | verify-demo"
         );
     };
     if command == "demo" {
@@ -111,17 +124,19 @@ fn main() -> Result<()> {
     if command == "verify-demo" {
         return fixtures::verify(&root);
     }
-    let mut store = Store::open(root)?;
+    let mut store = suojian::profiles::open(root)?;
     match command {
         "login" => {
-            login(&mut store, args.get(1).context("缺少服务器地址")?)?;
+            login(&mut store, args.get(1).context("缺少服务器地址")?, None)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&sync::once(&mut store)?)?
             );
         }
+        "import-local" => suojian::profiles::import_local(&mut store)?,
+        "recovery-words" => println!("{}", sync::recovery_words(&store)?.as_str()),
         "logout" => {
-            if let Some(config) = sync::logout(&store)? {
+            if let Some(config) = suojian::profiles::logout(&mut store)? {
                 sync::revoke_session(&config)?;
             }
             println!("已退出同步账号，本地便签保留");

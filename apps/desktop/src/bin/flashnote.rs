@@ -8,7 +8,7 @@ use std::{
 };
 use suojian::{
     cli::{self, CliError, ErrorKind, Filter, Reply, Request, SearchScope},
-    store::{Store, StoreBusy},
+    store::StoreBusy,
 };
 
 #[derive(Parser)]
@@ -311,7 +311,7 @@ fn dispatch(root: &Path, request: Request) -> Reply {
 
     #[cfg(target_os = "linux")]
     suojian::linux_keyring::install().map_err(CliError::io)?;
-    let mut store = match Store::open(root.to_owned()) {
+    let mut store = match suojian::profiles::open(root.to_owned()) {
         Ok(store) => store,
         Err(error) if error.is::<StoreBusy>() => {
             #[cfg(windows)]

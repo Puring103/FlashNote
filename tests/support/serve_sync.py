@@ -12,6 +12,7 @@ from server import Database, Handler, SyncHTTPServer
 parser = argparse.ArgumentParser()
 parser.add_argument("--data", type=Path, required=True)
 parser.add_argument("--port", type=int, default=0)
+parser.add_argument("--e2ee", action="store_true")
 parser.add_argument("--ready-file", type=Path)
 args = parser.parse_args()
 args.data.mkdir(parents=True, exist_ok=True)
@@ -21,7 +22,7 @@ issuer_port = int(previous["issuer"].split(":")[2]) if previous else 0
 fixture = Fixture(port=issuer_port, state_path=args.data / "provider-tokens.json")
 server = SyncHTTPServer(("127.0.0.1", args.port), Handler)
 server.daemon_threads = True
-server.database = Database(args.data / "sync.sqlite3", 512 * 1024 * 1024)
+server.database = Database(args.data / "sync.sqlite3", 512 * 1024 * 1024, e2ee=args.e2ee)
 server.accounts = Casdoor(fixture.issuer, fixture.issuer, "suojian-test", "fixture-secret", server.database)
 temporary = ready_file.with_suffix(".tmp")
 temporary.write_text(json.dumps({"url": f"http://127.0.0.1:{server.server_port}", "issuer": fixture.issuer}))

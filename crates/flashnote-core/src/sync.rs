@@ -36,6 +36,8 @@ pub struct Config {
     pub subject: String,
     pub name: String,
     pub generation: String,
+    #[serde(default)]
+    pub e2ee: bool,
     pub session: auth::Session,
 }
 
@@ -56,6 +58,8 @@ struct AccountKey {
 
 #[derive(Deserialize)]
 struct LoginConfig {
+    #[serde(default)]
+    vault_protocol: u32,
     mode: String,
 }
 
@@ -110,10 +114,13 @@ pub struct Plan {
     key: VaultKey,
     root: PathBuf,
     cursor: u64,
+    checkpoint: Option<String>,
     uploads: Vec<Upload>,
 }
 
 pub struct Cycle {
+    reset: bool,
+    upload_error: Option<String>,
     generation: String,
     uploaded: Vec<LocalObject>,
     incoming: Vec<Envelope>,
@@ -135,6 +142,8 @@ pub struct Usage {
 
 #[derive(Default, Serialize, Debug)]
 pub struct Report {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_error: Option<String>,
     pub uploaded: usize,
     pub downloaded: usize,
     pub merged: usize,
@@ -338,6 +347,7 @@ pub fn account_with_session(url: &str, session: auth::Session) -> Result<Connect
     key.0.copy_from_slice(&plain);
     Ok(Connection {
         config: Config {
+            e2ee: false,
             version: 3,
             url: url.trim_end_matches('/').into(),
             vault_id: account.vault_id,
@@ -349,6 +359,194 @@ pub fn account_with_session(url: &str, session: auth::Session) -> Result<Connect
         },
         key,
     })
+}
+
+#[derive(Deserialize)]
+struct VaultInfo {
+    mode: String,
+    vault_id: Option<String>,
+    fingerprint: Option<String>,
+    issuer: String,
+    subject: String,
+    name: String,
+}
+
+fn recovery_file(root: &Path, vault: &str) -> Result<PathBuf> {
+    let id = uuid::Uuid::parse_str(vault)?;
+    Ok(root.join(format!("recovery-{id}.protected")))
+}
+
+pub fn recovery_words(store: &Store) -> Result<zeroize::Zeroizing<String>> {
+    let cfg = config(store)?
+        .filter(|cfg| cfg.e2ee)
+        .context("当前账号没有端到端加密助记词")?;
+    let entropy = zeroize::Zeroizing::new(protect(
+        &std::fs::read(recovery_file(&store.root, &cfg.vault_id)?)?,
+        true,
+    )?);
+    Ok(zeroize::Zeroizing::new(
+        bip39::Mnemonic::from_entropy(&entropy)?.to_string(),
+    ))
+}
+
+fn open_vault(
+    c: &Client,
+    url: &str,
+    session: auth::Session,
+    root: &Path,
+    words: &str,
+    allow_managed: bool,
+) -> Result<Connection> {
+    use rand::RngCore;
+    use sha2::{Digest, Sha256};
+    let request = |body: serde_json::Value| -> Result<VaultInfo> {
+        let response = c
+            .post(format!("{url}/v1/account/vault"))
+            .bearer_auth(&session.token)
+            .json(&body)
+            .send()?;
+        Ok(serde_json::from_slice(&read_response(response, 8192)?)?)
+    };
+    let mut info = request(serde_json::json!({}))?;
+    // The identity provider can expose a user-facing name separately from the login ID.
+    if let Ok(response) = c
+        .get(format!("{url}/api/userinfo"))
+        .bearer_auth(&session.token)
+        .send()
+        && let Ok(bytes) = read_response(response, 8192)
+        && let Ok(profile) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && profile["sub"].as_str() == Some(info.subject.as_str())
+        && let Some(name) = profile["name"]
+            .as_str()
+            .filter(|name| !name.is_empty() && name.len() <= 512)
+    {
+        info.name = name.to_owned();
+    }
+    ensure!(
+        info.issuer == session.provider.issuer && !info.subject.is_empty(),
+        "身份服务不匹配"
+    );
+    if info.mode == "managed" {
+        ensure!(
+            allow_managed,
+            "此资料库使用托管密钥，服务器能解密内容。请确认允许托管模式后重试"
+        );
+        ensure!(
+            words.trim().is_empty(),
+            "该资料库使用服务器托管密钥，无需输入助记词"
+        );
+        let mut connection = account_with_session(url, session)?;
+        connection.config.name = info.name;
+        return Ok(connection);
+    }
+    ensure!(info.mode == "e2ee", "未知的加密模式");
+    let vault = info.vault_id.context("缺少资料库标识")?;
+    let path = recovery_file(root, &vault)?;
+    let owner = Owner {
+        url: url.into(),
+        issuer: info.issuer.clone(),
+        subject: info.subject.clone(),
+        vault_id: vault.clone(),
+    };
+    let binding = root.join("sync-owner.json");
+    if binding.exists() {
+        ensure!(
+            serde_json::from_slice::<Owner>(&std::fs::read(binding)?)? == owner,
+            "请为其他账户使用独立资料目录"
+        );
+    }
+    let mut entropy = zeroize::Zeroizing::new([0u8; 16]);
+    if !words.trim().is_empty() {
+        ensure!(
+            info.fingerprint.is_some(),
+            "新资料库将自动生成助记词，请清空输入框后重试"
+        );
+        let phrase = bip39::Mnemonic::parse_in(bip39::Language::English, words.trim())
+            .map_err(|_| anyhow::anyhow!("请输入正确的 12 个英文助记词"))?;
+        ensure!(phrase.word_count() == 12, "需要 12 个助记词");
+        entropy.copy_from_slice(&zeroize::Zeroizing::new(phrase.to_entropy()));
+    } else if path.exists() {
+        let saved = zeroize::Zeroizing::new(protect(&std::fs::read(&path)?, true)?);
+        ensure!(saved.len() == 16, "本机助记词文件无效");
+        entropy.copy_from_slice(&saved);
+    } else {
+        ensure!(
+            info.fingerprint.is_none(),
+            "新设备需要原有的 12 个助记词才能解密"
+        );
+        rand::rngs::OsRng.fill_bytes(&mut *entropy);
+    }
+    let mut key = VaultKey(zeroize::Zeroizing::new([0; 32]));
+    hkdf::Hkdf::<Sha256>::new(Some(vault.as_bytes()), &*entropy)
+        .expand(b"flashnote/e2ee/v1/key", &mut *key.0)
+        .map_err(|_| anyhow::anyhow!("密钥派生失败"))?;
+    let fingerprint = format!(
+        "{:x}",
+        Sha256::new()
+            .chain_update(b"flashnote/e2ee/v1/check")
+            .chain_update(&*key.0)
+            .finalize()
+    );
+    if let Some(remote) = info.fingerprint {
+        ensure!(remote == fingerprint, "助记词与该资料库不匹配");
+    }
+    // Secure the recovery material locally before the first network claim.
+    crate::local::atomic_write(&path, &protect(&*entropy, false)?)?;
+    let accepted = request(serde_json::json!({"vault_id": vault, "fingerprint": fingerprint}))?;
+    ensure!(
+        accepted.mode == "e2ee"
+            && accepted.vault_id.as_ref() == Some(&vault)
+            && accepted.fingerprint.as_ref() == Some(&fingerprint),
+        "另一台设备已初始化资料库，请输入其助记词"
+    );
+    Ok(Connection {
+        key,
+        config: Config {
+            version: 3,
+            url: url.into(),
+            vault_id: vault,
+            issuer: info.issuer,
+            subject: info.subject,
+            name: info.name,
+            generation: id(),
+            e2ee: true,
+            session,
+        },
+    })
+}
+
+pub fn login_device(
+    root: &Path,
+    words: &str,
+    allow_managed: bool,
+    url: &str,
+    username: &str,
+    secret: &str,
+    cancelled: Arc<AtomicBool>,
+) -> Result<Connection> {
+    let url = parse_server_address(url)?;
+    let c = client(&url)?;
+    let cfg = login_config(&c, &url)?;
+    let session = auth::account_login(&c, &url, username, secret)?;
+    let result = if cfg.vault_protocol == 0 {
+        if allow_managed && words.trim().is_empty() {
+            account_with_session(&url, session.clone())
+        } else {
+            Err(anyhow::anyhow!(
+                "旧服务器仅支持托管密钥。请确认允许托管模式后重试"
+            ))
+        }
+    } else {
+        open_vault(&c, &url, session.clone(), root, words, allow_managed)
+    };
+    if result.is_err() || cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = auth::revoke(&c, &session);
+        ensure!(
+            !cancelled.load(std::sync::atomic::Ordering::Relaxed),
+            "登录已取消"
+        );
+    }
+    result
 }
 
 pub fn login(
@@ -569,6 +767,14 @@ fn prepare_cycle(store: &mut Store, upload: bool) -> Result<Option<Plan>> {
         config,
         key: VaultKey(zeroize::Zeroizing::new(*store.key.0)),
         root: store.root.clone(),
+        checkpoint: store
+            .db
+            .query_row(
+                "SELECT value FROM sync_state WHERE key='checkpoint'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?,
         cursor,
         uploads,
     }))
@@ -604,64 +810,96 @@ fn download_assets(c: &Client, plan: &Plan, packet: &Envelope) -> Result<()> {
 pub fn transfer(mut plan: Plan) -> Result<Cycle> {
     refresh_config(&plan.root, &mut plan.config)?;
     let c = client(&plan.config.url)?;
-    let mut uploaded = vec![];
-    for upload in &plan.uploads {
-        for aid in &upload.envelope.header.assets {
-            let bytes = crate::local::wire_asset(&plan.root, &plan.key, aid)?;
-            ensure!(bytes.len() as u64 <= MAX_ASSET, "附件超过同步限制 64MiB");
-            let url = endpoint(&plan.config, &format!("assets/{aid}"));
-            let status = c
-                .head(&url)
-                .bearer_auth(&plan.config.session.token)
-                .send()?
-                .status();
-            if status == StatusCode::NOT_FOUND {
-                read_response(
-                    c.put(url)
-                        .bearer_auth(&plan.config.session.token)
-                        .body(bytes)
-                        .send()?,
-                    4096,
-                )?;
-            } else {
-                ensure!(status.is_success(), "附件检查返回 HTTP {}", status.as_u16());
-            }
+    let reset = if plan.cursor == 0 {
+        false
+    } else if let Some(revision) = &plan.checkpoint {
+        uuid::Uuid::parse_str(revision)?;
+        #[derive(Deserialize)]
+        struct Checkpoint {
+            valid: bool,
         }
-        let response = c
-            .put(endpoint(
+        let bytes = read_response(
+            c.get(endpoint(
                 &plan.config,
-                &format!("objects/{}", upload.local.id),
+                &format!("checkpoint?seq={}&revision={revision}", plan.cursor),
             ))
             .bearer_auth(&plan.config.session.token)
-            .json(&upload.envelope)
-            .send()?;
-        if response.status() == StatusCode::CONFLICT {
-            // Only stale bases are mergeable. Immutable revision/kind violations
-            // also use HTTP 409 and must surface as errors, without advancing state.
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct StaleBase {
-                current: Option<Envelope>,
+            .send()?,
+            4096,
+        )?;
+        !serde_json::from_slice::<Checkpoint>(&bytes)?.valid
+    } else {
+        true
+    };
+    let mut uploaded = vec![];
+    let mut upload_error = None;
+    for upload in plan.uploads.iter().filter(|_| !reset) {
+        let attempt = (|| -> Result<bool> {
+            for aid in &upload.envelope.header.assets {
+                let bytes = crate::local::wire_asset(&plan.root, &plan.key, aid)?;
+                ensure!(bytes.len() as u64 <= MAX_ASSET, "附件超过同步限制 64MiB");
+                let url = endpoint(&plan.config, &format!("assets/{aid}"));
+                let status = c
+                    .head(&url)
+                    .bearer_auth(&plan.config.session.token)
+                    .send()?
+                    .status();
+                if status == StatusCode::NOT_FOUND {
+                    read_response(
+                        c.put(url)
+                            .bearer_auth(&plan.config.session.token)
+                            .body(bytes)
+                            .send()?,
+                        4096,
+                    )?;
+                } else {
+                    ensure!(status.is_success(), "附件检查返回 HTTP {}", status.as_u16());
+                }
             }
-            let mut bytes = Vec::new();
-            response.take(MAX_RESPONSE + 1).read_to_end(&mut bytes)?;
-            ensure!(bytes.len() as u64 <= MAX_RESPONSE, "同步响应过大");
-            let stale: StaleBase = serde_json::from_slice(&bytes)
-                .context("同步服务返回 HTTP 409，且不是可合并的版本过期响应")?;
-            let current = stale.current.context("云端基础版本丢失，无法安全合并")?;
-            validate(&current, &plan.config, &plan.key)?;
-            ensure!(
-                current.header.object_id == upload.local.id
-                    && current.header.kind == upload.local.kind
-                    && Some(&current.header.revision)
-                        != upload.envelope.header.base_revision.as_ref(),
-                "云端版本过期响应与上传对象不匹配"
-            );
-            // Pull below obtains the newest server version. Keep this local edit pending.
-            continue;
+            let response = c
+                .put(endpoint(
+                    &plan.config,
+                    &format!("objects/{}", upload.local.id),
+                ))
+                .bearer_auth(&plan.config.session.token)
+                .json(&upload.envelope)
+                .send()?;
+            if response.status() == StatusCode::CONFLICT {
+                // Only stale bases are mergeable. Immutable revision/kind violations
+                // also use HTTP 409 and must surface as errors, without advancing state.
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct StaleBase {
+                    current: Option<Envelope>,
+                }
+                let mut bytes = Vec::new();
+                response.take(MAX_RESPONSE + 1).read_to_end(&mut bytes)?;
+                ensure!(bytes.len() as u64 <= MAX_RESPONSE, "同步响应过大");
+                let stale: StaleBase = serde_json::from_slice(&bytes)
+                    .context("同步服务返回 HTTP 409，且不是可合并的版本过期响应")?;
+                let current = stale.current.context("云端基础版本丢失，无法安全合并")?;
+                validate(&current, &plan.config, &plan.key)?;
+                ensure!(
+                    current.header.object_id == upload.local.id
+                        && current.header.kind == upload.local.kind
+                        && Some(&current.header.revision)
+                            != upload.envelope.header.base_revision.as_ref(),
+                    "云端版本过期响应与上传对象不匹配"
+                );
+                // Pull below obtains the newest server version. Keep this local edit pending.
+                return Ok(false);
+            }
+            read_response(response, 4096)?;
+            Ok(true)
+        })();
+        match attempt {
+            Ok(true) => uploaded.push(upload.local.clone()),
+            Ok(false) => (),
+            Err(error) if !error.to_string().contains("HTTP 409") => {
+                upload_error.get_or_insert_with(|| format!("{}：{error}", upload.local.id));
+            }
+            Err(error) => return Err(error),
         }
-        read_response(response, 4096)?;
-        uploaded.push(upload.local.clone());
     }
     #[derive(Deserialize)]
     struct Page {
@@ -669,7 +907,7 @@ pub fn transfer(mut plan: Plan) -> Result<Cycle> {
         cursor: u64,
         more: bool,
     }
-    let mut cursor = plan.cursor;
+    let mut cursor = if reset { 0 } else { plan.cursor };
     let mut incoming = vec![];
     // Apply each page before fetching the next one to bound pull memory.
     let more = {
@@ -700,6 +938,8 @@ pub fn transfer(mut plan: Plan) -> Result<Cycle> {
     )?)
     .context("同步服务返回的空间用量格式无效，请检查服务地址或代理配置")?;
     Ok(Cycle {
+        reset,
+        upload_error,
         generation: plan.config.generation.clone(),
         uploaded,
         incoming,
@@ -863,6 +1103,7 @@ pub fn apply(store: &mut Store, cycle: Cycle) -> Result<Report> {
         .filter(|current| current.generation == cycle.generation)
         .context("登录已退出或更换，本轮同步结果已忽略")?;
     let mut report = Report {
+        upload_error: cycle.upload_error,
         uploaded: cycle.uploaded.len(),
         usage: cycle.usage,
         more: cycle.more,
@@ -873,6 +1114,15 @@ pub fn apply(store: &mut Store, cycle: Cycle) -> Result<Report> {
         read_cursor(&tx)? == cycle.after,
         "同步进度已更新，请重新同步"
     );
+    if cycle.reset {
+        tx.execute_batch("DELETE FROM sync_heads; DELETE FROM sync_packets; DELETE FROM sync_state WHERE key='checkpoint';")?;
+    }
+    if let Some(last) = cycle.incoming.last() {
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state VALUES('checkpoint',?)",
+            [&last.header.revision],
+        )?;
+    }
     let mut changed = BTreeSet::new();
     for local in &cycle.uploaded {
         head(&tx, local)?;
@@ -1009,6 +1259,23 @@ pub fn apply(store: &mut Store, cycle: Cycle) -> Result<Report> {
         report.downloaded += 1;
         changed.insert(remote.id);
     }
+    // A deleted group can arrive before or after a note created offline.
+    let orphaned = {
+        let mut stmt = tx.prepare("SELECT n.payload FROM objects n JOIN objects g ON g.id=json_extract(n.payload,'$.group_id') WHERE n.kind='note' AND g.kind='group' AND json_extract(g.payload,'$.deleted')=1")?;
+        stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for bytes in orphaned {
+        let mut note: Note = serde_json::from_slice(&bytes)?;
+        let previous = note.revision.clone();
+        note.group_id = DEFAULT_GROUP.into();
+        note.parent_revision = Some(previous.clone());
+        note.revision = id();
+        let updated = encode_local("note", &note.id, &note.revision, &note)?;
+        install(&tx, &updated, Some(&previous), &store.device, true)?;
+        changed.insert(note.id);
+        report.merged += 1;
+    }
     tx.execute(
         "INSERT OR REPLACE INTO sync_state VALUES('cursor',?)",
         [cycle.cursor.to_string()],
@@ -1053,6 +1320,9 @@ pub fn once(store: &mut Store) -> Result<Report> {
         report.conflicts += page.conflicts;
         report.usage = page.usage;
         report.more = page.more;
+    }
+    if let Some(error) = &report.upload_error {
+        bail!("已接收云端变更，上传失败：{error}");
     }
     Ok(report)
 }

@@ -1,6 +1,6 @@
 # gpui-note-editor
 
-原生 GPUI 的结构化便签编辑器试验版。Rust crate，无 WebView。索笺通过 path dependency 使用它，也可以单独引用。
+原生 GPUI 的结构化便签编辑器试验版。Rust crate，无 WebView。闪记通过 path dependency 使用它，也可以单独引用。
 
 ## 移植来源与边界
 
@@ -48,7 +48,7 @@ assert_eq!(editor.document.to_markdown(), "**你好**");
 
 ## 验证与独立示例
 
-从索笺项目目录执行：
+从闪记项目目录执行：
 
 ```powershell
 cargo test -p gpui-note-editor --no-default-features
@@ -61,7 +61,7 @@ cargo run -p gpui-note-editor --example editor
 
 支持基础文字编辑、常用行内格式、标题、列表和待办输入规则、段落拆分合并、Unicode 字素删除、格式化片段插入、事务回滚、撤销重做及组合输入提交。导入导出支持常用 Markdown；空白会规范化，不承诺 Markdown 源码逐字还原。内嵌 Markdown 图片引用保留，目前正文显示替代文字。
 
-`Attachment` 是保留的节点数据接口，尚未完成原子节点选择、宿主渲染器和拖动协议。索笺现有的图片、文件和录音卡片继续由应用负责，不算已统一进入这个编辑文档。
+`Attachment` 是保留的节点数据接口，尚未完成原子节点选择、宿主渲染器和拖动协议。闪记现有的图片、文件和录音卡片继续由应用负责，不算已统一进入这个编辑文档。
 
 复杂表格、完整多层嵌套结构、富文本剪贴板、辅助功能、双向文字、拖选自动滚动、输入历史的连续打字分组等仍未完整实现。当前按编辑操作保存历史，输入法组合提交合并为一次历史操作。实际中文候选框、鼠标拖选和窗口缩放尚未进行桌面实测。
 

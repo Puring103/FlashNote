@@ -21,6 +21,9 @@ struct Server {
 }
 impl Server {
     fn start() -> Self {
+        Self::with_e2ee(false)
+    }
+    fn with_e2ee(e2ee: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let ready = temp.path().join("ready.json");
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/serve_sync.py");
@@ -34,6 +37,9 @@ impl Server {
             .arg(&ready)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        if e2ee {
+            command.arg("--e2ee");
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -101,6 +107,49 @@ fn pair(server: &Server) -> (TempDir, Store, Store) {
     sync::once(&mut b).unwrap();
     assert_ne!(a.device, b.device);
     (temp, a, b)
+}
+
+#[test]
+fn e2ee_recovery_checks_existing_key_and_syncs_between_devices() {
+    let server = Server::with_e2ee(true);
+    let temp = tempfile::tempdir().unwrap();
+    let login = |s: &mut Store, words: &str| {
+        let connection = sync::login_device(
+            &s.root,
+            words,
+            false,
+            &server.url,
+            "alice",
+            "login123",
+            Default::default(),
+        )?;
+        sync::connect_account(s, connection)
+    };
+    let mut a = test_store::open_store(temp.path().join("a")).unwrap();
+    login(&mut a, "").unwrap();
+    let words = sync::recovery_words(&a).unwrap();
+    assert_eq!(words.split_whitespace().count(), 12);
+    let nid = add(&mut a, "保密正文");
+    sync::once(&mut a).unwrap();
+    let mut b = test_store::open_store(temp.path().join("b")).unwrap();
+    assert!(login(&mut b, "").is_err());
+    assert!(login(&mut b, "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").is_err());
+    login(&mut b, &words).unwrap();
+    sync::once(&mut b).unwrap();
+    assert_eq!(text(&b, &nid), "保密正文");
+    sync::logout(&a).unwrap();
+    login(&mut a, "").unwrap();
+    assert_eq!(sync::recovery_words(&a).unwrap().as_str(), words.as_str());
+    assert!(!server.temp.path().join("sync-master.key").exists());
+    assert_eq!(
+        server
+            .db()
+            .query_row("SELECT COUNT(*) FROM managed_keys", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(sync::account_with_session(&server.url, server.session()).is_err());
 }
 
 #[test]
@@ -175,6 +224,99 @@ fn converge(a: &mut Store, b: &mut Store) {
         sync::once(a).unwrap();
         sync::once(b).unwrap();
     }
+}
+
+#[test]
+fn signed_out_notes_require_explicit_import() {
+    let server = Server::start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = suojian::profiles::open(dir.path().into()).unwrap();
+    let nid = add(&mut store, "offline only");
+    let connection = || sync::account_with_session(&server.url, server.session()).unwrap();
+    suojian::profiles::connect(&mut store, connection()).unwrap();
+    assert!(store.notes.is_empty());
+    assert!(suojian::profiles::has_local(&store).unwrap());
+    suojian::profiles::logout(&mut store).unwrap();
+    assert_eq!(text(&store, &nid), "offline only");
+    suojian::profiles::connect(&mut store, connection()).unwrap();
+    suojian::profiles::import_local(&mut store).unwrap();
+    assert_eq!(text(&store, &nid), "offline only");
+    assert!(!suojian::profiles::has_local(&store).unwrap());
+    suojian::profiles::logout(&mut store).unwrap();
+    assert!(store.notes.is_empty());
+}
+
+#[test]
+fn failed_upload_allows_remote_reads() {
+    let server = Server::start();
+    let (_tmp, mut a, mut b) = pair(&server);
+    let remote = add(&mut a, "remote");
+    sync::once(&mut a).unwrap();
+    server
+        .db()
+        .execute("UPDATE vaults SET quota=used", [])
+        .unwrap();
+    let local = add(&mut b, "local");
+    assert!(sync::once(&mut b).is_err());
+    assert_eq!(text(&b, &remote), "remote");
+    server
+        .db()
+        .execute("UPDATE vaults SET quota=1048576", [])
+        .unwrap();
+    converge(&mut a, &mut b);
+    assert_eq!(text(&a, &local), "local");
+}
+
+#[test]
+fn late_note_in_deleted_group_moves_to_default() {
+    let server = Server::start();
+    let (_tmp, mut a, mut b) = pair(&server);
+    let g = a.create_group_with_color("offline", 42).unwrap();
+    converge(&mut a, &mut b);
+    a.delete_group(&g.id, DEFAULT_GROUP).unwrap();
+    let nid = add(&mut b, "late note");
+    b.batch_notes(&[nid.clone()], Some(&g.id), None).unwrap();
+    converge(&mut a, &mut b);
+    for s in [&a, &b] {
+        assert_eq!(
+            s.notes.iter().find(|n| n.id == nid).unwrap().group_id,
+            DEFAULT_GROUP
+        );
+    }
+}
+
+#[test]
+fn checkpoint_reconciles_after_restore() {
+    let server = Server::start();
+    let (_tmp, mut a, mut b) = pair(&server);
+    let backup = server.temp.path().join("backup.db");
+    server
+        .db()
+        .execute("VACUUM INTO ?", [backup.to_str().unwrap()])
+        .unwrap();
+    let post_backup = add(&mut a, "keep on recovery");
+    converge(&mut a, &mut b);
+    let restored = Command::new(
+        std::env::var("SUOJIAN_TEST_PYTHON").unwrap_or_else(|_| "python".into()),
+    )
+    .args([
+        "-c",
+        "import sqlite3,sys; sqlite3.connect(sys.argv[1]).backup(sqlite3.connect(sys.argv[2]))",
+    ])
+    .arg(backup)
+    .arg(server.temp.path().join("sync.sqlite3"))
+    .status()
+    .unwrap();
+    assert!(restored.success());
+    let temp = tempfile::tempdir().unwrap();
+    let mut c = test_store::open_store(temp.path().join("new")).unwrap();
+    server.connect(&mut c);
+    sync::once(&mut c).unwrap();
+    let post_restore = add(&mut c, "new on restored server");
+    sync::once(&mut c).unwrap();
+    converge(&mut b, &mut c);
+    assert_eq!(text(&c, &post_backup), "keep on recovery");
+    assert_eq!(text(&b, &post_restore), "new on restored server");
 }
 
 #[test]

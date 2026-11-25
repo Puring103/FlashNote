@@ -115,7 +115,7 @@ pub fn read(path: &Path) -> Result<Import> {
     let manifest: Manifest = serde_json::from_slice(&json)?;
     ensure!(
         manifest.format == "suojian" && manifest.version == 1,
-        "不支持的索笺压缩包版本"
+        "不支持的闪记压缩包版本"
     );
     let mut ids = BTreeSet::new();
     for group in &manifest.groups {

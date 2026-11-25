@@ -41,14 +41,17 @@ fn note(store: &Store, v: &Value) -> Result<Note> {
     Ok(n.clone())
 }
 pub fn dispatch(root: PathBuf, request: &str) -> Result<Value> {
-    let mut s = Store::open(root)?;
+    let mut s = suojian_core::profiles::open(root)?;
     dispatch_request(&mut s, request)
 }
 
 fn dispatch_request(s: &mut Store, request: &str) -> Result<Value> {
     let v: Value = serde_json::from_str(request)?;
     let operation = field(&v, "op")?;
-    let replace_notes = matches!(operation, "list" | "sync" | "import_zip");
+    let replace_notes = matches!(
+        operation,
+        "list" | "sync" | "import_zip" | "login" | "logout" | "import_local"
+    );
     let mut changed = Vec::new();
     let mut saved_id: Option<String> = None;
     let mut sync_error = None;
@@ -207,16 +210,27 @@ fn dispatch_request(s: &mut Store, request: &str) -> Result<Value> {
             s.create_group_with_color(field(&v, "name")?, color as u32)?;
         }
         "login" => {
-            let connection = sync::login(
+            let connection = sync::login_device(
+                &suojian_core::profiles::credentials(s)?,
+                v["words"].as_str().unwrap_or(""),
+                v["allow_managed"].as_bool().unwrap_or(false),
                 field(&v, "url")?,
                 field(&v, "username")?,
                 field(&v, "password")?,
                 Arc::new(AtomicBool::new(false)),
             )?;
-            sync::connect_account(s, connection)?;
+            let show_words = connection.config.e2ee;
+            suojian_core::profiles::connect(s, connection)?;
+            if show_words {
+                details = json!(sync::recovery_words(s)?.as_str());
+            }
         }
+        "recovery_words" => {
+            details = json!(sync::recovery_words(s)?.as_str());
+        }
+        "import_local" => suojian_core::profiles::import_local(s)?,
         "logout" => {
-            if let Some(config) = sync::logout(s)? {
+            if let Some(config) = suojian_core::profiles::logout(s)? {
                 let _ = sync::revoke_session(&config);
             }
         }
@@ -251,8 +265,9 @@ fn dispatch_request(s: &mut Store, request: &str) -> Result<Value> {
         .filter(|n| replace_notes || changed.contains(&n.id))
         .map(|n| json!({"note":n, "source":n.editor_markdown()}))
         .collect();
+    let config = sync::config(s)?;
     Ok(
-        json!({"notes":notes,"replace_notes":replace_notes,"groups":s.groups,"account":sync::config(s)?.map(|c| c.name),"saved_id":saved_id,"sync_error":sync_error,"details":details}),
+        json!({"storage_root":s.root, "has_local":config.is_some() && suojian_core::profiles::has_local(s)?, "e2ee": config.as_ref().is_some_and(|c| c.e2ee), "notes":notes,"replace_notes":replace_notes,"groups":s.groups,"account":config.map(|c| c.name),"saved_id":saved_id,"sync_error":sync_error,"details":details}),
     )
 }
 
@@ -307,9 +322,9 @@ mod android {
             STORE.with(|cached| {
                 let mut cached = cached.borrow_mut();
                 let root = PathBuf::from(root);
-                if cached.as_ref().is_none_or(|store| store.root != root) {
+                if cached.is_none() {
                     *cached = None;
-                    *cached = Some(Store::open(root)?);
+                    *cached = Some(suojian_core::profiles::open(root)?);
                 }
                 dispatch_request(cached.as_mut().unwrap(), &request)
             })

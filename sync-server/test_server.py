@@ -31,7 +31,7 @@ def encrypted(size=60):
 class SyncServerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.database = Database(Path(self.temp.name) / "sync.sqlite3", 1024 * 1024)
+        self.database = Database(Path(self.temp.name) / "sync.sqlite3", 1024 * 1024, e2ee=False)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.database = self.database
         self.issuer = Fixture()
@@ -95,6 +95,29 @@ class SyncServerTests(unittest.TestCase):
         self.assertEqual(len({a["vault_id"] for _, a in results}), 1)
         self.assertEqual(len({a["key"] for _, a in results}), 1)
         self.assertEqual(self.database.managed_account(Identity(self.issuer.issuer,"bob","renamed"))["name"], "renamed")
+
+    def test_e2ee_policy_and_first_device_confirmation(self):
+        self.database.e2ee = True
+        alice = self.account["token"]
+        self.assertEqual(self.raw("POST", "/v1/account/vault", alice, {})[1]["mode"], "managed")
+        bob = self.issuer.token("bob")
+        self.assertEqual(self.raw("POST", "/v1/account/key", bob, {})[0], 409)
+        info = self.raw("POST", "/v1/account/vault", bob, {})[1]
+        self.assertEqual(info["mode"], "e2ee")
+        vault = info["vault_id"]
+        self.assertEqual(self.raw("GET", f"/v1/{vault}/usage", bob)[0], 401)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            def claim(fp):
+                return self.raw("POST", "/v1/account/vault", bob, {"vault_id":vault,"fingerprint":fp*64})[1]
+            results = list(pool.map(claim, ["a", "b"]))
+        self.assertEqual(results[0]["fingerprint"], results[1]["fingerprint"])
+        self.assertNotIn("key", results[0])
+        self.assertEqual(self.raw("GET", f"/v1/{vault}/usage", bob)[0], 200)
+        self.database.e2ee = False
+        self.assertEqual(self.raw("POST", "/v1/account/key", bob, {})[0], 409)
+        self.assertEqual(self.raw("POST", "/v1/account/vault", bob, {})[1]["mode"], "e2ee")
+        with self.database.connect() as db:
+            self.assertIsNone(db.execute("SELECT sealed FROM managed_keys WHERE vault=?", (vault,)).fetchone())
 
     def test_authentication_and_vault_isolation(self):
         aid = uid()

@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod local;
 pub mod media;
 pub mod model;
+pub mod profiles;
 pub mod remote_images;
 pub mod store;
 pub mod sync;

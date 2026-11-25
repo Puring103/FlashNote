@@ -65,6 +65,8 @@ pub struct Runtime {
     model_downloads: HashMap<String, u8>,
     model_errors: HashMap<String, String>,
     account_busy: bool,
+    prompt_recovery: bool,
+    prompt_import: bool,
     account_error: Option<String>,
     account_cancel: Arc<AtomicBool>,
     transcript_jobs: HashMap<String, String>,
@@ -120,6 +122,8 @@ impl Runtime {
             model_downloads: HashMap::new(),
             model_errors: HashMap::new(),
             account_busy: false,
+            prompt_recovery: false,
+            prompt_import: false,
             account_error: None,
             account_cancel: Arc::new(AtomicBool::new(false)),
             transcript_jobs: HashMap::new(),
@@ -140,12 +144,17 @@ impl Runtime {
                     } else {
                         result
                     };
-                    match result
-                        .map_err(anyhow::Error::msg)
-                        .and_then(|connection| sync::connect_account(&mut self.store, connection))
-                    {
+                    match result.map_err(anyhow::Error::msg).and_then(|connection| {
+                        suojian::profiles::connect(&mut self.store, connection)
+                    }) {
                         Ok(()) => {
                             self.account_error = None;
+                            self.prompt_import =
+                                suojian::profiles::has_local(&self.store).unwrap_or(false);
+                            self.prompt_recovery = sync::config(&self.store)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|c| c.e2ee);
                             self.sync_enabled = true;
                             self.sync_more = false;
                             self.sync_status = "等待同步".into();
@@ -294,7 +303,9 @@ impl Runtime {
                 Ok(report) => {
                     self.sync_success = Some(now());
                     self.sync_usage = Some(report.usage);
-                    self.sync_status = if report.conflicts > 0 {
+                    self.sync_status = if let Some(error) = report.upload_error {
+                        format!("上传失败：{error}")
+                    } else if report.conflicts > 0 {
                         self.status = format!("已同步，{} 处离线冲突已保留副本", report.conflicts);
                         self.status.clone()
                     } else if report.more {
@@ -3323,6 +3334,12 @@ impl View {
             cx.new(|cx| InputState::new(window, cx).placeholder("https://sync.example.com"));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("账号"));
         let secret = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("密码"));
+        let managed = cx.new(|_| false);
+        let phrase = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("已有资料库的新设备填写 12 个英文词")
+        });
         let target = cx.entity().downgrade();
         let error = cx.new(|_| String::new());
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -3330,6 +3347,8 @@ impl View {
             let address_submit = address.clone();
             let username_submit = username.clone();
             let secret_submit = secret.clone();
+            let phrase_submit = phrase.clone();
+            let managed_submit = managed.clone();
             let error_submit = error.clone();
             dialog
                 .title("登录同步账号")
@@ -3359,7 +3378,27 @@ impl View {
                         .child(div().text_sm().child("账号 / 邮箱"))
                         .child(Input::new(&username).w(px(404.)).h(px(36.)))
                         .child(div().text_sm().child("密码"))
-                        .child(Input::new(&secret).w(px(404.)).h(px(36.))),
+                        .child(Input::new(&secret).w(px(404.)).h(px(36.)))
+                        .child(
+                            div()
+                                .text_sm()
+                                .child("助记词（新建资料库或已授权设备可留空）"),
+                        )
+                        .child(Input::new(&phrase).w(px(404.)).h(px(36.)))
+                        .child(
+                            Checkbox::new("managed-consent")
+                                .label("允许托管模式（服务器可解密）")
+                                .checked(*managed.read(cx))
+                                .on_click({
+                                    let managed = managed.clone();
+                                    move |value, _, cx| {
+                                        managed.update(cx, |state, cx| {
+                                            *state = *value;
+                                            cx.notify();
+                                        })
+                                    }
+                                }),
+                        ),
                 )
                 .when(!error.read(cx).is_empty(), |d| {
                     d.child(
@@ -3384,6 +3423,8 @@ impl View {
                     let username = username_submit.read(cx).value().trim().to_string();
                     let secret =
                         zeroize::Zeroizing::new(secret_submit.read(cx).value().to_string());
+                    let allow_managed = *managed_submit.read(cx);
+                    let words = zeroize::Zeroizing::new(phrase_submit.read(cx).value().to_string());
                     if username.is_empty() || secret.is_empty() {
                         error_submit.update(cx, |e, cx| {
                             *e = "请输入账号和密码".into();
@@ -3402,10 +3443,22 @@ impl View {
                                 runtime.account_error = None;
                                 runtime.account_cancel = Arc::new(AtomicBool::new(false));
                             }
+                            let root = suojian::profiles::credentials(&v.shared.borrow().store);
                             let cancelled = v.shared.borrow().account_cancel.clone();
                             let tx = v.tx.clone();
                             std::thread::spawn(move || {
-                                let result = sync::login(&url, &username, &secret, cancelled)
+                                let result = root
+                                    .and_then(|root| {
+                                        sync::login_device(
+                                            &root,
+                                            &words,
+                                            allow_managed,
+                                            &url,
+                                            &username,
+                                            &secret,
+                                            cancelled,
+                                        )
+                                    })
                                     .map_err(|error| format!("{error:#}"));
                                 let _ = tx.send(Job::Account(result));
                             });
@@ -3416,7 +3469,53 @@ impl View {
         });
     }
 
+    fn confirm_local_import(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let runtime = self.shared.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let runtime = runtime.clone();
+            dialog
+                .title("将本地便签导入当前账号？")
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("导入")
+                        .cancel_text("暂不导入"),
+                )
+                .on_ok(move |_, _, _| {
+                    let mut r = runtime.borrow_mut();
+                    r.account_error = suojian::profiles::import_local(&mut r.store)
+                        .err()
+                        .map(|e| e.to_string());
+                    r.generation += 1;
+                    true
+                })
+        });
+    }
+
+    fn show_recovery(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match sync::recovery_words(&self.shared.borrow().store) {
+            Ok(words) => window.open_dialog(cx, move |dialog, _, _| {
+                let copy = words.clone();
+                dialog.title("请备份 12 个助记词")
+                    .child("服务器仅保存便签和附件密文。新设备需要以下助记词；失去全部已授权设备和助记词后，云端内容无法恢复。")
+                    .child(words.to_string())
+                    .confirm()
+                    .button_props(DialogButtonProps::default().ok_text("复制").cancel_text("关闭"))
+                    .on_ok(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.to_string()));
+                        true
+                    })
+            }),
+            Err(error) => window.open_dialog(cx, move |d, _, _| d.title("无法查看助记词").child(error.to_string())),
+        }
+    }
+
     fn settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if std::mem::take(&mut self.shared.borrow_mut().prompt_import) {
+            cx.defer_in(window, |v, w, cx| v.confirm_local_import(w, cx));
+        } else if std::mem::take(&mut self.shared.borrow_mut().prompt_recovery) {
+            cx.defer_in(window, |view, window, cx| view.show_recovery(window, cx));
+        }
         self.settings = self.shared.borrow().store.settings.clone();
         let runtime = self.shared.borrow();
         let sync_status = runtime.sync_status.clone();
@@ -3447,81 +3546,102 @@ impl View {
             .border_1()
             .border_color(rgb(LINE));
         account_panel = match account {
-            Ok(Some(config)) => account_panel.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .flex_wrap()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("同步账号已登录"),
-                            )
-                            .child(div().text_sm().child(format!("账号 {}", config.name)))
-                            .child(div().text_sm().text_color(rgb(MUTED)).child(config.url)),
+            Ok(Some(config)) => account_panel
+                .when(
+                    suojian::profiles::has_local(&self.shared.borrow().store).unwrap_or(false),
+                    |p| {
+                        p.child(
+                            label_button("import-local", "导入本地便签")
+                                .on_click(cx.listener(|v, _, w, cx| v.confirm_local_import(w, cx))),
+                        )
+                    },
+                )
+                .when(config.e2ee, |panel| {
+                    panel.child("端到端加密").child(
+                        label_button("sync-recovery", "查看 / 复制助记词")
+                            .on_click(cx.listener(|v, _, window, cx| v.show_recovery(window, cx))),
                     )
-                    .child(
-                        label_button("account-manage", "账号管理 / 修改密码")
-                            .border_1()
-                            .border_color(rgb(0xb8c9c2))
-                            .bg(rgb(0xe8eee8))
-                            .text_color(rgb(TEAL))
-                            .on_click({
-                                let issuer = config.issuer.clone();
-                                cx.listener(move |v, _, _, cx| {
-                                    let result = (|| -> anyhow::Result<()> {
-                                        let mut url = suojian::auth::secure_url(&issuer)?;
-                                        url.set_path("/account");
-                                        webbrowser::open(url.as_str())?;
-                                        Ok(())
-                                    })();
-                                    if let Err(error) = result {
-                                        v.shared.borrow_mut().account_error =
-                                            Some(error.to_string());
-                                        cx.notify();
-                                    }
-                                })
-                            }),
-                    )
-                    .child(
-                        label_button("account-logout", "退出登录")
-                            .border_1()
-                            .border_color(rgb(LINE))
-                            .bg(rgb(0xf3eee5))
-                            .text_color(rgb(0x8e4b3f))
-                            .on_click(cx.listener(|v, _, _, cx| {
-                                let mut runtime = v.shared.borrow_mut();
-                                match sync::logout(&runtime.store) {
-                                    Ok(config) => {
-                                        runtime.sync_enabled = false;
-                                        runtime.sync_more = false;
-                                        runtime.sync_usage = None;
-                                        runtime.account_error = None;
-                                        runtime.sync_status =
-                                            "已退出登录，本地便签可继续使用".into();
-                                        if let Some(config) = config {
-                                            let tx = v.tx.clone();
-                                            std::thread::spawn(move || {
-                                                let result = sync::revoke_session(&config)
-                                                    .map_err(|e| format!("{e:#}"));
-                                                let _ = tx.send(Job::LoggedOut(result));
-                                            });
+                })
+                .when(!config.e2ee, |panel| {
+                    panel.child("此资料库使用服务器托管密钥。")
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .flex_wrap()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("同步账号已登录"),
+                                )
+                                .child(div().text_sm().child(format!("账号 {}", config.name)))
+                                .child(div().text_sm().text_color(rgb(MUTED)).child(config.url)),
+                        )
+                        .child(
+                            label_button("account-manage", "账号管理 / 修改密码")
+                                .border_1()
+                                .border_color(rgb(0xb8c9c2))
+                                .bg(rgb(0xe8eee8))
+                                .text_color(rgb(TEAL))
+                                .on_click({
+                                    let issuer = config.issuer.clone();
+                                    cx.listener(move |v, _, _, cx| {
+                                        let result = (|| -> anyhow::Result<()> {
+                                            let mut url = suojian::auth::secure_url(&issuer)?;
+                                            url.set_path("/account");
+                                            webbrowser::open(url.as_str())?;
+                                            Ok(())
+                                        })();
+                                        if let Err(error) = result {
+                                            v.shared.borrow_mut().account_error =
+                                                Some(error.to_string());
+                                            cx.notify();
+                                        }
+                                    })
+                                }),
+                        )
+                        .child(
+                            label_button("account-logout", "退出登录")
+                                .border_1()
+                                .border_color(rgb(LINE))
+                                .bg(rgb(0xf3eee5))
+                                .text_color(rgb(0x8e4b3f))
+                                .on_click(cx.listener(|v, _, _, cx| {
+                                    let mut runtime = v.shared.borrow_mut();
+                                    match suojian::profiles::logout(&mut runtime.store) {
+                                        Ok(config) => {
+                                            runtime.sync_enabled = false;
+                                            runtime.sync_more = false;
+                                            runtime.sync_usage = None;
+                                            runtime.account_error = None;
+                                            runtime.sync_status =
+                                                "已退出登录，本地便签可继续使用".into();
+                                            if let Some(config) = config {
+                                                let tx = v.tx.clone();
+                                                std::thread::spawn(move || {
+                                                    let result = sync::revoke_session(&config)
+                                                        .map_err(|e| format!("{e:#}"));
+                                                    let _ = tx.send(Job::LoggedOut(result));
+                                                });
+                                            }
+                                        }
+                                        Err(error) => {
+                                            runtime.account_error = Some(error.to_string())
                                         }
                                     }
-                                    Err(error) => runtime.account_error = Some(error.to_string()),
-                                }
-                                cx.notify();
-                            })),
-                    ),
-            ),
+                                    cx.notify();
+                                })),
+                        ),
+                ),
             Ok(None) => account_panel
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("未登录"))
                 .child(
@@ -3565,7 +3685,7 @@ impl View {
                         |v, _, w, cx| {
                             {
                                 let mut runtime = v.shared.borrow_mut();
-                                match sync::logout(&runtime.store) {
+                                match suojian::profiles::logout(&mut runtime.store) {
                                     Ok(_) => {
                                         runtime.sync_enabled = false;
                                         runtime.sync_more = false;

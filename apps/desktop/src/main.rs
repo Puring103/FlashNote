@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
     let root = suojian::cli::data_dir();
     #[cfg(target_os = "linux")]
     suojian::linux_keyring::install()?;
-    let mut store = store::Store::open(root)?;
+    let mut store = suojian::profiles::open(root.clone())?;
     #[cfg(windows)]
     desktop_windows::migrate_shortcuts(&mut store)?;
     audio::cleanup_scratch(&store.root.join("scratch"));
@@ -59,7 +59,7 @@ fn main() -> anyhow::Result<()> {
     }
     let mut runtime = ui::Runtime::new(store);
     #[cfg(windows)]
-    let cli_jobs = match suojian::cli_pipe::listen(&runtime.store.root) {
+    let cli_jobs = match suojian::cli_pipe::listen(&root) {
         Ok(jobs) => Some(jobs),
         Err(error) => {
             runtime.status = format!("命令行接口启动失败：{error}");

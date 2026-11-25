@@ -1,4 +1,4 @@
-"""账号同步：Casdoor 统一认证；同步密钥由服务端主密钥加密托管。
+"""账号同步：Casdoor 认证；新库默认客户端持钥，兼容旧托管库。
 
 Run: python server.py --data ./data --port 47831
 HTTP is allowed only for local development; use HTTPS outside localhost.
@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -48,7 +49,8 @@ class ClosingConnection(sqlite3.Connection):
 
 
 class Database:
-    def __init__(self, path, quota):
+    def __init__(self, path, quota, e2ee=True):
+        self.e2ee = e2ee
         self.path, self.quota = str(path), quota
         with self.connect() as db:
             db.executescript("""
@@ -57,6 +59,8 @@ class Database:
                     id TEXT PRIMARY KEY, issuer TEXT NOT NULL, subject TEXT NOT NULL,
                     quota INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(issuer,subject));
+                CREATE TABLE IF NOT EXISTS client_keys(
+                    vault TEXT PRIMARY KEY, fingerprint TEXT);
                 CREATE TABLE IF NOT EXISTS managed_keys(
                     vault TEXT PRIMARY KEY, sealed BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS receipts(
@@ -79,12 +83,39 @@ class Database:
                     PRIMARY KEY(vault,object_id,asset_id));
             """)
 
+    def account_info(self, identity, claim):
+        if not isinstance(claim, dict) or set(claim) not in (set(), {"vault_id", "fingerprint"}):
+            raise ApiError(400, "invalid account request")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT id FROM vaults WHERE issuer=? AND subject=?",
+                             (identity.issuer, identity.subject)).fetchone()
+            vault = row["id"] if row else None
+            if not vault and self.e2ee and not claim:
+                vault = str(uuid.uuid4())
+                db.execute("INSERT INTO vaults(id,issuer,subject,quota) VALUES(?,?,?,?)",
+                           (vault, identity.issuer, identity.subject, self.quota))
+                db.execute("INSERT INTO client_keys(vault) VALUES(?)", (vault,))
+            record = db.execute("SELECT fingerprint FROM client_keys WHERE vault=?", (vault,)).fetchone()
+            if claim:
+                fp = claim["fingerprint"]
+                if not record or claim["vault_id"] != vault or not isinstance(fp, str) or len(fp) != 64 or any(c not in "0123456789abcdef" for c in fp):
+                    raise ApiError(400, "invalid key confirmation")
+                db.execute("UPDATE client_keys SET fingerprint=? WHERE vault=? AND fingerprint IS NULL", (fp, vault))
+                record = db.execute("SELECT fingerprint FROM client_keys WHERE vault=?", (vault,)).fetchone()
+            return {"vault_id": vault, "issuer": identity.issuer, "subject": identity.subject,
+                    "name": identity.name, "mode": "e2ee" if record else "managed",
+                    "fingerprint": record["fingerprint"] if record else None}
+
     def managed_account(self, identity):
         """认证后按归属领取密钥；创建、并发登录和主密钥文件读写在同一写事务内串行。"""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT id FROM vaults WHERE issuer=? AND subject=?",
                              (identity.issuer, identity.subject)).fetchone()
+            if (not row and self.e2ee) or (row and db.execute(
+                    "SELECT 1 FROM client_keys WHERE vault=?", (row["id"],)).fetchone()):
+                raise ApiError(409, "end-to-end encryption requires an updated client")
             path = Path(self.path).with_name('sync-master.key')
             if not path.exists():
                 if row or db.execute("SELECT 1 FROM managed_keys LIMIT 1").fetchone():
@@ -121,7 +152,8 @@ class Database:
 
     def authenticate(self, vault, identity):
         with self.connect() as db:
-            row = db.execute("SELECT 1 FROM vaults WHERE id=? AND issuer=? AND subject=?",
+            row = db.execute("""SELECT 1 FROM vaults WHERE id=? AND issuer=? AND subject=?
+                AND NOT EXISTS (SELECT 1 FROM client_keys WHERE vault=vaults.id AND fingerprint IS NULL)""",
                              (vault, identity.issuer, identity.subject)).fetchone()
         if not row:
             raise ApiError(401, "unauthorized")
@@ -193,6 +225,11 @@ class Database:
                 db.execute("""UPDATE assets SET created=? WHERE vault=? AND id=? AND NOT EXISTS(
                     SELECT 1 FROM refs WHERE vault=? AND asset_id=?)""", (time.time(), vault, aid, vault, aid))
             return 200, {"seq": seq}
+
+    def matches_cursor(self, vault, seq, revision):
+        with self.connect() as db:
+            return db.execute("SELECT 1 FROM receipts WHERE vault=? AND seq=? AND revision=?",
+                              (vault, seq, revision)).fetchone() is not None
 
     def changes(self, vault, after):
         with self.connect() as db:
@@ -313,9 +350,11 @@ class Handler(BaseHTTPRequestHandler):
         path = parts.path.strip("/").split("/")
         accounts = self.server.accounts
         if self.command == "GET" and path == ["health"]:
-            return self.reply(200, {"ok": True, "protocol": 2, "authentication": "casdoor"})
+            return self.reply(200, {"ok": True, "version": "0.11.0", "protocol": 3, "authentication": "casdoor"})
         if self.command == "GET" and path == ["auth", "config"]:
-            return self.reply(200, {**accounts.configuration(), "account_login": True, "mode": "casdoor"})
+            return self.reply(200, {**accounts.configuration(), "account_login": True, "vault_protocol": 1,
+                                    "new_vault_encryption": "e2ee" if db.e2ee else "managed",
+                                    "registration_enabled": getattr(self.server, "registration_enabled", False), "mode": "casdoor"})
         if self.command == "POST" and path in (["auth", "login"], ["auth", "refresh"], ["auth", "logout"]):
             body = json.loads(self.body(4096))
             try:
@@ -338,6 +377,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(503, "identity service unavailable") from None
         except Exception:
             raise ApiError(401, "valid login required") from None
+        if self.command == "POST" and path == ["v1", "account", "vault"]:
+            return self.reply(200, db.account_info(identity, json.loads(self.body(1024))))
         if self.command == "POST" and path == ["v1", "account", "key"]:
             self.body(1024)
             return self.reply(200, db.managed_account(identity))
@@ -352,6 +393,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(400, "invalid listing query")
                 return self.reply(200, db.list_objects(vault, query.get("kind", [None])[0],
                     int(query.get("limit", [str(BROWSE_LIMIT)])[0]), query.get("cursor", [None])[0]))
+            if self.command == "GET" and route == "checkpoint":
+                query = parse_qs(parts.query)
+                return self.reply(200, {"valid": db.matches_cursor(vault, int(query["seq"][0]), query["revision"][0])})
             if self.command == "GET" and route == "changes":
                 after = int(parse_qs(parts.query).get("after", ["0"])[0])
                 if after < 0:
@@ -370,9 +414,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(200, {"ok": True})
                 if self.command in ("GET", "HEAD"):
                     with db.connect() as conn:
-                        row = conn.execute("SELECT payload FROM assets WHERE vault=? AND id=?", (vault, oid)).fetchone()
+                        field = "length(payload)" if self.command == "HEAD" else "payload"
+                        row = conn.execute(f"SELECT {field} FROM assets WHERE vault=? AND id=?", (vault, oid)).fetchone()
                     if not row:
                         raise ApiError(404, "asset not found")
+                    if self.command == "HEAD":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        self.send_header("Content-Length", str(row[0]))
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        return
                     return self.reply(200, row[0], binary=True)
             if route == "objects":
                 if self.command == "PUT":
@@ -398,6 +450,27 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class SyncHTTPServer(ThreadingHTTPServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.workers = threading.BoundedSemaphore(16)
+
+    def process_request(self, request, client_address):
+        request.settimeout(30)
+        if not self.workers.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.workers.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.workers.release()
+
     def service_actions(self):
         if time.monotonic() < getattr(self, "next_gc", 0):
             return
@@ -422,7 +495,10 @@ def main():
     if args.quota <= 0:
         parser.error("quota must be positive")
     args.data.mkdir(parents=True, exist_ok=True)
-    database = Database(args.data / "sync.sqlite3", args.quota)
+    policy = os.environ.get("SUOJIAN_E2EE", "true").lower()
+    if policy not in ("true", "false"):
+        parser.error("SUOJIAN_E2EE must be true or false")
+    database = Database(args.data / "sync.sqlite3", args.quota, e2ee=policy == "true")
     client_secret = os.environ.get("CASDOOR_CLIENT_SECRET", "")
     if secret_file := os.environ.get("CASDOOR_CLIENT_SECRET_FILE"):
         client_secret = Path(secret_file).read_text(encoding="utf-8").rstrip("\r\n")
@@ -431,6 +507,10 @@ def main():
                       os.environ.get("CASDOOR_CLIENT_ID", ""),
                       client_secret, database)
     server = SyncHTTPServer((args.host, args.port), Handler)
+    registration = os.environ.get("SUOJIAN_REGISTRATION", "false").lower()
+    if registration not in ("true", "false"):
+        parser.error("SUOJIAN_REGISTRATION must be true or false")
+    server.registration_enabled = registration == "true"
     server.daemon_threads = True
     server.database = database
     server.accounts = accounts

@@ -1,12 +1,12 @@
 ﻿$ErrorActionPreference = 'Stop'
 $targetRoot = [IO.Path]::GetFullPath($PSScriptRoot)
-$targetExe = Join-Path $targetRoot '索笺.exe'
+$targetExe = Join-Path $targetRoot '闪记.exe'
 if (-not (Test-Path -LiteralPath $targetExe)) { throw '请从安装目录运行卸载脚本。' }
 if (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $targetExe }) {
     throw '请先从设置或托盘退出闪记，再卸载。'
 }
 # Remove only named application files. User notes and unrelated files are preserved.
-foreach ($name in @('索笺.exe', '索笺同步工具.exe', 'flashnote.exe', 'suojian-cli.exe', 'version.txt', '使用说明.txt')) {
+foreach ($name in @('闪记.exe', '索笺.exe', '索笺同步工具.exe', 'flashnote.exe', 'suojian-cli.exe', 'version.txt', '使用说明.txt')) {
     $item = Join-Path $targetRoot $name
     if (Test-Path -LiteralPath $item) { Remove-Item -LiteralPath $item -Force }
 }

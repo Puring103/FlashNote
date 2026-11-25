@@ -1,6 +1,7 @@
 """Casdoor HTTP contract: application isolation, outages, rotation and logout."""
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import time
@@ -9,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 from unittest.mock import patch
 
+from bootstrap import bootstrap
 from casdoor import Casdoor
 from identity import IdentityUnavailable
 from server import Database
@@ -50,6 +52,32 @@ class ProviderHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(json.dumps(value).encode())
+
+
+class RegistrationTests(unittest.TestCase):
+    @patch("bootstrap.os.chown", create=True)
+    def test_registration_toggle_reconfigures_existing_database_and_proxy(self, _chown):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = {"SUOJIAN_ORIGIN": "https://notes.example"}
+            bootstrap(root, env)
+            seed = root / "casdoor-runtime" / "init_data.json"
+            account = (root / "initial-account.json").read_bytes()
+            self.assertFalse(json.loads(seed.read_text(encoding="utf8"))["applications"][0]["enableSignUp"])
+            with sqlite3.connect(root / "data" / "casdoor.db") as db:
+                db.execute("CREATE TABLE application(owner, client_id, enable_sign_up, signup_items, display_name)")
+                db.execute("CREATE TABLE organization(owner,name,display_name)")
+                db.execute("CREATE TABLE user(owner,name,display_name)")
+                db.execute("INSERT INTO application VALUES('admin','suojian',0,NULL,'索笺')")
+                db.commit()
+                for enabled in (True, False):
+                    bootstrap(root, env | {"SUOJIAN_REGISTRATION": str(enabled).lower()})
+                    app = json.loads(seed.read_text(encoding="utf8"))["applications"][0]
+                    self.assertEqual(app["enableSignUp"], enabled)
+                    self.assertEqual(bool(db.execute("SELECT enable_sign_up FROM application").fetchone()[0]), enabled)
+                    self.assertEqual("handle @signup" in (root / "Caddyfile").read_text(), not enabled)
+            db.close()
+            self.assertEqual((root / "initial-account.json").read_bytes(), account)
 
 
 class CasdoorTests(unittest.TestCase):

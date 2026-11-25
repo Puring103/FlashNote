@@ -9,7 +9,7 @@ $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Suoji
 if (-not $PSBoundParameters.ContainsKey('Destination')) {
     $registered = (Get-ItemProperty -LiteralPath $uninstallKey -Name InstallLocation -ErrorAction SilentlyContinue).InstallLocation
     $legacy = Join-Path $env:LOCALAPPDATA 'Programs\Suojian'
-    if ($registered -and (Test-Path -LiteralPath (Join-Path $registered '索笺.exe') -PathType Leaf)) {
+    if ($registered -and (Test-Path -LiteralPath $registered -PathType Container)) {
         $Destination = $registered
     } elseif (Test-Path -LiteralPath (Join-Path $legacy '索笺.exe') -PathType Leaf) {
         $Destination = $legacy
@@ -20,9 +20,9 @@ if (-not $PSBoundParameters.ContainsKey('Destination')) {
 $sourceRoot = $PSScriptRoot
 $sourceExe = [IO.Path]::GetFullPath($ApplicationPath)
 $targetRoot = [IO.Path]::GetFullPath($Destination)
-$targetExe = Join-Path $targetRoot '索笺.exe'
+$targetExe = Join-Path $targetRoot '闪记.exe'
 if ($RepairRegistration) {
-    if (-not (Test-Path -LiteralPath $targetExe)) { throw '安装目录中没有索笺.exe，请先安装程序。' }
+    if (-not (Test-Path -LiteralPath $targetExe)) { throw '安装目录中没有闪记.exe，请先安装程序。' }
 } elseif (-not (Test-Path -LiteralPath $sourceExe)) { throw '请从解压后的安装包中运行此脚本。' }
 if (-not $RepairRegistration -and $targetRoot.TrimEnd('\') -eq $sourceRoot.TrimEnd('\')) { throw '安装目录不能与安装包目录相同。' }
 if (-not $RepairRegistration -and (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $targetExe })) {
@@ -114,7 +114,7 @@ namespace SuojianInstaller {
     [SuojianInstaller.ShellRegistration]::Register($shortcutPath)
     foreach ($legacyName in @('索笺.lnk', '索笺 Suojian.lnk', '索笺\索笺 Suojian.lnk')) {
         $legacyPath = Join-Path $programs $legacyName
-        if ((Test-Path -LiteralPath $legacyPath) -and $shell.CreateShortcut($legacyPath).TargetPath -eq $targetExe) { Remove-Item -LiteralPath $legacyPath }
+        if ((Test-Path -LiteralPath $legacyPath) -and ($shell.CreateShortcut($legacyPath).TargetPath -in @($targetExe, (Join-Path $targetRoot '索笺.exe')))) { Remove-Item -LiteralPath $legacyPath }
     }
     (New-Object -ComObject Shell.Application).RefreshMenu()
 }
