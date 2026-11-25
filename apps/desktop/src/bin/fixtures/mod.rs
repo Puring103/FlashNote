@@ -573,8 +573,7 @@ fn inspect(a: &Store, b: &Store) -> Result<serde_json::Value> {
             for store in [a, b] {
                 let wire = std::fs::read(store.root.join("sync-assets").join(aid))?;
                 ensure!(
-                    suojian_core::local::open_asset(&store.key, aid, &wire)?
-                        == store.asset(aid)?,
+                    suojian_core::local::open_asset(&store.key, aid, &wire)? == store.asset(aid)?,
                     "附件传输缓存认证失败或与本地原件不一致"
                 );
             }
