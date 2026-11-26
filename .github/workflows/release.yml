@@ -76,15 +76,26 @@ jobs:
           if (!(Test-Path runtime/whisper/Release/whisper-cli.exe -PathType Leaf)) {
             throw 'Speech engine bundle incomplete'
           }
+      - name: Install pinned Inno Setup compiler
+        run: |
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-6.4.3.exe'
+          $compilerDir = Join-Path $env:RUNNER_TEMP 'inno-setup'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe' -OutFile $setup
+          if ((Get-FileHash -LiteralPath $setup).Hash -ne 'F3C42116542C4CC57263C5BA6C4FEABFC49FE771F2F98A79D2F7628B8762723B') {
+            throw 'Inno Setup checksum mismatch'
+          }
+          $install = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOICONS','/CURRENTUSER',('/DIR="' + $compilerDir + '"') -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Inno Setup installation failed: $($install.ExitCode)" }
       - name: Package Windows x64
         run: |
-          $archive = .\scripts\package.ps1 | Select-Object -Last 1
+          $compiler = Join-Path $env:RUNNER_TEMP 'inno-setup/ISCC.exe'
+          $setup = .\scripts\package.ps1 -Compiler $compiler | Select-Object -Last 1
           New-Item -ItemType Directory -Path dist | Out-Null
-          Copy-Item -LiteralPath $archive -Destination "dist/FlashNote-$env:VERSION-windows-x64.zip"
+          Copy-Item -LiteralPath $setup -Destination dist
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows
-          path: dist/*.zip
+          path: dist/*-setup.exe
           if-no-files-found: error
           compression-level: 0
 
@@ -188,7 +199,7 @@ jobs:
         shell: bash
         run: |
           cd dist
-          files=("FlashNote-${VERSION}-windows-x64.zip" "FlashNote-${VERSION}-linux-x86_64.tar.gz" "FlashNote-${VERSION}-android.apk")
+          files=("FlashNote-${VERSION}-windows-x64-setup.exe" "FlashNote-${VERSION}-linux-x86_64.tar.gz" "FlashNote-${VERSION}-android.apk")
           sha256sum "${files[@]}" > SHA256SUMS.txt
           tag="$GITHUB_REF_NAME"
           if draft=$(gh release view "$tag" --json isDraft --jq .isDraft); then

@@ -9,3 +9,5 @@ Unsplash 图片使用规则：https://unsplash.com/license
 演示录音在 `runtime/speech-test`，由 Windows Huihui 合成公开的测试句子生成，没有采集用户麦克风；转写文字是本地 whisper.cpp 实际输出，包含 tiny 模型的识别误差。
 
 应用界面中的 SVG 图标由项目内 `src/icons.rs` 定义。设计目录的概念图是之前对话生成的界面参考，不作为运行时背景使用。
+
+Windows 语音组件随包附带的许可声明位于 `licenses/`，对应 [Whisper.cpp v1.7.6](https://github.com/ggml-org/whisper.cpp/blob/v1.7.6/LICENSE) 和 [SDL 2.28.5](https://github.com/libsdl-org/SDL/blob/release-2.28.5/LICENSE.txt)。更新组件时请同步核对这些声明。

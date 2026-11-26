@@ -14,10 +14,15 @@ version=${version#flashnote }
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 name="FlashNote-${version}-linux-x86_64"
 stage=$(mktemp -d)
-trap 'rm -f -- "$stage/$name/flashnote-desktop" "$stage/$name/flashnote" "$stage/$name/README.txt"; rmdir "$stage/$name" "$stage" 2>/dev/null || true' EXIT
+trap 'rm -f -- "$stage/$name/flashnote-desktop" "$stage/$name/flashnote" "$stage/$name/README.txt" "$stage/$name/LICENSE" "$stage/$name"/LICENSE-*.txt; rmdir "$stage/$name" "$stage" 2>/dev/null || true' EXIT
 mkdir -p runtime/packages "$stage/$name"
 install -m 755 "$bin_dir/suojian" "$stage/$name/flashnote-desktop"
 install -m 755 "$bin_dir/flashnote" "$stage/$name/flashnote"
+install -m 644 LICENSE "$stage/$name/LICENSE"
+install -m 644 crates/gpui/LICENSE-APACHE "$stage/$name/LICENSE-gpui.txt"
+install -m 644 crates/gpui-component/LICENSE-APACHE "$stage/$name/LICENSE-gpui-component.txt"
+install -m 644 crates/gpui-note-editor/LICENSE "$stage/$name/LICENSE-gpui-note-editor.txt"
+install -m 644 assets/icons/lucide/LICENSE "$stage/$name/LICENSE-lucide.txt"
 cat > "$stage/$name/README.txt" <<'EOF'
 FlashNote for Linux (x86_64, built on Ubuntu 24.04)
 
